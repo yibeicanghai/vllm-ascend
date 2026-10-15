@@ -17,6 +17,13 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_dec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.ops.attn_chunking import (
+    build_chunk_cu_seqlens,
+    build_chunk_sas_metadata,
+    fixed_chunk_ranges,
+    get_chunk_request_indices,
+    slice_per_request_tensor,
+)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
@@ -980,6 +987,11 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         self.vllm_config = get_current_vllm_config()
 
+        # Attention chunking config (opt-in; disabled by default)
+        _ascend_config = get_ascend_config()
+        self.enable_attn_chunking = getattr(_ascend_config, "enable_attn_chunking", False)
+        self.attn_chunk_size = getattr(_ascend_config, "attn_chunk_size", 4096)
+
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
@@ -1207,55 +1219,111 @@ class AscendDSACPImpl(DSAAttentionImpl):
             need_gather_q_kv,
             full_gather_wo_a_enabled,
         )
-        o_proj_input = self._restore_tp_head_layout(
-            local_attn_output,
-            layer_name,
-            attn_metadata[0],
-            skip_all_to_all=full_gather_wo_a_enabled,
-        )
-        num_tokens = o_proj_input.shape[0]
 
-        # o
+        # --- o_proj section (optionally chunked, prefill only) ---
+        num_tokens = local_attn_output.shape[0]
+        use_o_proj_chunking = (
+            self.enable_attn_chunking
+            and _has_prefill(attn_metadata[0].attn_state)
+            and num_tokens > self.attn_chunk_size
+        )
+
         if full_gather_wo_a_enabled:
             self._switch_o_proj_to_full_weight(o_proj_full_handles)
         o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
+
         try:
-            if get_ascend_device_type() in {AscendDeviceType.A5}:
-                o = o_proj_input.view(num_tokens, o_proj_groups, -1)
-                o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
-                o = torch_npu.npu_transpose_quant_batchmatmul(
-                    o,
-                    self.wo_a.weight,
-                    dtype=torch.bfloat16,
-                    bias=None,
-                    group_sizes=(0, 0, 32),
-                    x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
-                    x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
-                    perm_x1=(1, 0, 2),
-                    perm_x2=(0, 1, 2),
-                    perm_y=(1, 0, 2),
-                )
-                o = o.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+            if use_o_proj_chunking:
+                for chunk_start, chunk_end in fixed_chunk_ranges(num_tokens, self.attn_chunk_size):
+                    chunk_attn = local_attn_output[chunk_start:chunk_end]
+                    chunk_o_proj_input = self._restore_tp_head_layout(
+                        chunk_attn,
+                        layer_name,
+                        attn_metadata[0],
+                        skip_all_to_all=full_gather_wo_a_enabled,
+                    )
+                    chunk_tokens = chunk_o_proj_input.shape[0]
+
+                    if get_ascend_device_type() in {AscendDeviceType.A5}:
+                        o = chunk_o_proj_input.view(chunk_tokens, o_proj_groups, -1)
+                        o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+                        o = torch_npu.npu_transpose_quant_batchmatmul(
+                            o,
+                            self.wo_a.weight,
+                            dtype=torch.bfloat16,
+                            bias=None,
+                            group_sizes=(0, 0, 32),
+                            x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
+                            x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
+                            perm_x1=(1, 0, 2),
+                            perm_x2=(0, 1, 2),
+                            perm_y=(1, 0, 2),
+                        )
+                        o = o.reshape(chunk_tokens, -1)
+                        output[chunk_start:chunk_end] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+                    else:
+                        chunk_o_proj_input = chunk_o_proj_input.view(chunk_tokens, o_proj_groups, -1)
+                        if olora_tp_enable():
+                            chunk_o_proj_input = self.wo_a(chunk_o_proj_input)
+                        else:
+                            chunk_o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                                chunk_o_proj_input,
+                                self.wo_a.weight,
+                                bias=None,
+                                scale=None,
+                                perm_x1=(1, 0, 2),
+                                perm_x2=(0, 1, 2),
+                                perm_y=(1, 0, 2),
+                                batch_split_factor=1,
+                            )
+                        chunk_o_proj_input = chunk_o_proj_input.reshape(chunk_tokens, -1)
+                        output[chunk_start:chunk_end] = self._apply_wo_b(
+                            chunk_o_proj_input, full_gather_wo_a_enabled
+                        )
+                    del chunk_attn, chunk_o_proj_input
             else:
-                o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
-                if olora_tp_enable():
-                    o_proj_input = self.wo_a(o_proj_input)
-                else:
-                    # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
-                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                        o_proj_input,
+                o_proj_input = self._restore_tp_head_layout(
+                    local_attn_output,
+                    layer_name,
+                    attn_metadata[0],
+                    skip_all_to_all=full_gather_wo_a_enabled,
+                )
+                num_tokens = o_proj_input.shape[0]
+
+                if get_ascend_device_type() in {AscendDeviceType.A5}:
+                    o = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                    o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+                    o = torch_npu.npu_transpose_quant_batchmatmul(
+                        o,
                         self.wo_a.weight,
+                        dtype=torch.bfloat16,
                         bias=None,
-                        scale=None,
+                        group_sizes=(0, 0, 32),
+                        x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
+                        x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
                         perm_x1=(1, 0, 2),
                         perm_x2=(0, 1, 2),
                         perm_y=(1, 0, 2),
-                        batch_split_factor=1,
                     )
-                o_proj_input = o_proj_input.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+                    o = o.reshape(num_tokens, -1)
+                    output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+                else:
+                    o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                    if olora_tp_enable():
+                        o_proj_input = self.wo_a(o_proj_input)
+                    else:
+                        o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                            o_proj_input,
+                            self.wo_a.weight,
+                            bias=None,
+                            scale=None,
+                            perm_x1=(1, 0, 2),
+                            perm_x2=(0, 1, 2),
+                            perm_y=(1, 0, 2),
+                            batch_split_factor=1,
+                        )
+                    o_proj_input = o_proj_input.reshape(num_tokens, -1)
+                    output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
         finally:
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_tp_weight()
@@ -1275,6 +1343,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         (compress_kv_cache, swa_kv_cache, state_cache, _, _, _) = DeviceOperator.unpack_dsa_forward_kv_cache(
             kv_cache, self.compress_ratio
         )
+        compressor_attn_metadata = None
         if self.compress_ratio == 4:
             (compressor_attn_metadata, compressor_kv_state_metadata, _, _, swa_metadata) = attn_metadata
         elif self.compress_ratio == 128:
@@ -1445,7 +1514,123 @@ class AscendDSACPImpl(DSAAttentionImpl):
             **extra_attn_kwargs,
         )
 
-        if self.compress_ratio <= 1:
+        # --- Attention op call (optionally chunked, prefill only) ---
+        num_local_tokens = q.shape[0]
+        use_attn_chunking = (
+            self.enable_attn_chunking
+            and has_prefill
+            and num_local_tokens > self.attn_chunk_size
+        )
+
+        if use_attn_chunking:
+            attn_output = torch.empty(
+                (num_local_tokens, self.num_heads, self.head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            # Pre-compute per-chunk static kwargs that don't change
+            swa_block_table = swa_metadata.req_metadata.block_table
+            cmp_block_table = (
+                compressor_attn_metadata.req_metadata.block_table
+                if compressor_attn_metadata is not None and compressor_attn_metadata.req_metadata is not None
+                else None
+            )
+            cu_seqlens_ori_kv_full = extra_attn_kwargs.get("cu_seqlens_ori_kv", local_seq_lengths_query)
+            cu_seqlens_cmp_kv_full = req_metadata.cu_cmp_seqlen_list if hasattr(req_metadata, "cu_cmp_seqlen_list") else None
+
+            for chunk_start, chunk_end in fixed_chunk_ranges(num_local_tokens, self.attn_chunk_size):
+                chunk_q = q[chunk_start:chunk_end]
+
+                chunk_cu_seqlens_q = build_chunk_cu_seqlens(
+                    local_seq_lengths_query, chunk_start, chunk_end
+                )
+                if chunk_cu_seqlens_q.shape[0] <= 1:
+                    attn_output[chunk_start:chunk_end] = 0
+                    del chunk_q
+                    continue
+
+                req_indices = get_chunk_request_indices(
+                    local_seq_lengths_query, chunk_start, chunk_end
+                )
+                chunk_seqused_kv = slice_per_request_tensor(local_seq_lengths_key, req_indices)
+                chunk_swa_block_table = slice_per_request_tensor(swa_block_table, req_indices)
+                chunk_cmp_block_table = slice_per_request_tensor(cmp_block_table, req_indices)
+                chunk_cu_seqlens_ori_kv = slice_per_request_tensor(cu_seqlens_ori_kv_full, req_indices)
+
+                chunk_metadata = build_chunk_sas_metadata(
+                    metadata_op=DeviceOperator.get_dsa_sparse_attn_metadata_op(),
+                    chunk_cu_seqlens_q=chunk_cu_seqlens_q,
+                    chunk_seqused_kv=chunk_seqused_kv,
+                    chunk_block_table=chunk_swa_block_table,
+                    num_heads_q=self.num_heads,
+                    head_dim=self.head_dim,
+                    sliding_window=self.window_size,
+                    compress_ratio=self.compress_ratio,
+                    index_topk=self.index_topk if self.indexer is not None else None,
+                    cu_seqlens_ori_kv=chunk_cu_seqlens_ori_kv,
+                    cu_seqlens_cmp_kv=None,
+                    device=str(q.device),
+                )
+
+                chunk_kwargs = dict(
+                    cu_seqlens_q=chunk_cu_seqlens_q,
+                    seqused_kv=chunk_seqused_kv,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=max(self.compress_ratio, 1),
+                    ori_mask_mode=4,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                )
+                if cu_seqlens_ori_kv_full is not None:
+                    DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                        chunk_kwargs, cu_seqlens_ori_kv=chunk_cu_seqlens_ori_kv
+                    )
+
+                if self.compress_ratio <= 1:
+                    chunk_out = attn_op(
+                        chunk_q,
+                        ori_kv=swa_kv_cache,
+                        ori_block_table=chunk_swa_block_table,
+                        metadata=chunk_metadata,
+                        **chunk_kwargs,
+                    )[0]
+                elif self.compress_ratio == 4:
+                    DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                        chunk_kwargs, cu_seqlens_cmp_kv=cu_seqlens_cmp_kv_full
+                    )
+                    chunk_topk = compress_topk_idxs[chunk_start:chunk_end] if compress_topk_idxs is not None else None
+                    chunk_out = attn_op(
+                        chunk_q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        cmp_sparse_indices=chunk_topk,
+                        ori_block_table=chunk_swa_block_table,
+                        cmp_block_table=chunk_cmp_block_table,
+                        metadata=chunk_metadata,
+                        cmp_mask_mode=3,
+                        **chunk_kwargs,
+                    )[0]
+                else:
+                    DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                        chunk_kwargs, cu_seqlens_cmp_kv=cu_seqlens_cmp_kv_full
+                    )
+                    chunk_out = attn_op(
+                        chunk_q,
+                        ori_kv=swa_kv_cache,
+                        cmp_kv=compress_kv_cache,
+                        ori_block_table=chunk_swa_block_table,
+                        cmp_block_table=chunk_cmp_block_table,
+                        metadata=chunk_metadata,
+                        cmp_mask_mode=3,
+                        **chunk_kwargs,
+                    )[0]
+
+                attn_output[chunk_start:chunk_end] = chunk_out
+                del chunk_q, chunk_out
+        elif self.compress_ratio <= 1:
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
