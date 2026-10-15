@@ -306,6 +306,25 @@ class AscendConfig:
         self.enable_ffn_chunking = enable_ffn_chunking
         if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
             raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
+
+        enable_attn_chunking = additional_config.get("enable_attn_chunking", False)
+        if not isinstance(enable_attn_chunking, bool):
+            raise ValueError(
+                "enable_attn_chunking must be a boolean, got "
+                f"{type(enable_attn_chunking).__name__}: {enable_attn_chunking}"
+            )
+        attn_chunk_size = additional_config.get("attn_chunk_size", 4096)
+        if isinstance(attn_chunk_size, bool) or not isinstance(attn_chunk_size, int):
+            raise ValueError(
+                f"attn_chunk_size must be an integer, got {type(attn_chunk_size).__name__}: {attn_chunk_size}"
+            )
+        self.attn_chunk_size = attn_chunk_size
+        if self.attn_chunk_size <= 0:
+            raise ValueError(f"attn_chunk_size must be positive, got {self.attn_chunk_size}")
+        self.enable_attn_chunking = enable_attn_chunking
+        if self.enable_attn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("enable_attn_chunking currently requires eager mode; set enforce_eager=true.")
+
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
         if self.enable_kv_nz:
             if vllm_config.model_config is None:
