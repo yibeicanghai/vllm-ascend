@@ -1024,6 +1024,23 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self.compressor_norm = self.compressor.norm
             self.compressor_norm_eps = self.compressor.norm_eps
 
+    def _chunked_scatter(self, cache, updates, slot_mapping, prefill=True):
+        """Scatter updates into cache, optionally splitting into smaller chunks.
+
+        npu_scatter_nd_update_v2 scales super-linearly with token count due to
+        cache contention. Splitting into attn_chunk_size batches keeps each
+        call in the linear regime, reducing total wall time.
+        Only active during prefill where token count is large enough to benefit.
+        """
+        if not self.enable_attn_chunking or not prefill or updates is None or updates.shape[0] <= self.attn_chunk_size:
+            DeviceOperator.dsa_kv_compress_scatter(cache, updates, slot_mapping)
+            return
+        for start in range(0, updates.shape[0], self.attn_chunk_size):
+            end = min(start + self.attn_chunk_size, updates.shape[0])
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                cache, slot_mapping[start:end], updates[start:end]
+            )
+
     def _compute_compressor_metadata(
         self,
         metadata: AscendDSAReqMetadata,
@@ -1439,7 +1456,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
-        DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping)
+        self._chunked_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping, prefill=has_prefill)
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
@@ -1491,7 +1508,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
             if compressed_kv.numel() == 0:
                 compressed_kv = None
-            DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+            self._chunked_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping, prefill=has_prefill)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
@@ -1749,18 +1766,28 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if self.indexer.compressor.rotate:
             kv = rotate_activation(kv, indexer_kv_scale_metadata.hadamard)
 
-        _, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
-            kv,
-            indexer_k_cache,
-            indexer_full_cache,
-            indexer_slot_mapping,
-        )
-        if kv_scale is not None:
-            DeviceOperator.dsa_indexer_scatter_scale_part3(
-                kv_scale,
-                indexer_scale_cache,
+        if self.enable_attn_chunking and _has_prefill(attn_metadata[0].attn_state):
+            kv_int8, kv_scale = torch_npu.npu_dynamic_quant(kv, dst_type=torch.int8)
+            kv_scale = kv_scale.unsqueeze(-1)
+            self._chunked_scatter(indexer_k_cache, kv_int8, indexer_slot_mapping, prefill=True)
+            if kv_scale is not None:
+                kv_scale_f16 = kv_scale.to(torch.float16)
+                if kv_scale_f16.ndim < 4:
+                    kv_scale_f16 = kv_scale_f16.unsqueeze(-1)
+                self._chunked_scatter(indexer_scale_cache, kv_scale_f16, indexer_slot_mapping, prefill=True)
+        else:
+            _, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
+                kv,
+                indexer_k_cache,
+                indexer_full_cache,
                 indexer_slot_mapping,
             )
+            if kv_scale is not None:
+                DeviceOperator.dsa_indexer_scatter_scale_part3(
+                    kv_scale,
+                    indexer_scale_cache,
+                    indexer_slot_mapping,
+                )
 
     def _indexer_select_topk(
         self,
