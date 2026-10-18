@@ -1,4 +1,5 @@
 import math
+import logging
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
@@ -33,6 +34,9 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     olora_tp_enable,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def hadamard_transform_ref(
@@ -1024,21 +1028,33 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self.compressor_norm = self.compressor.norm
             self.compressor_norm_eps = self.compressor.norm_eps
 
-    def _chunked_scatter(self, cache, updates, slot_mapping, prefill=True):
+    def _chunked_scatter(self, cache, updates, slot_mapping, prefill=True, compress_ratio=None):
         """Scatter updates into cache, optionally splitting into smaller chunks.
 
-        npu_scatter_nd_update_v2 scales super-linearly with token count due to
-        cache contention. Splitting into attn_chunk_size batches keeps each
-        call in the linear regime, reducing total wall time.
+        The effective chunk size is scaled by compress_ratio so that each
+        chunk matches the baseline (per_rank × TP) token count regardless
+        of whether the data is full-rate (SWA) or compressed.
         Only active during prefill where token count is large enough to benefit.
         """
-        if not self.enable_attn_chunking or not prefill or updates is None or updates.shape[0] <= self.attn_chunk_size:
+        if compress_ratio is None:
+            compress_ratio = max(self.compress_ratio, 1)
+        base_chunk_size = max(self.attn_chunk_size // compress_ratio, 1)
+        if (not self.enable_attn_chunking or not prefill or updates is None
+                or updates.shape[0] <= self.attn_chunk_size):
             DeviceOperator.dsa_kv_compress_scatter(cache, updates, slot_mapping)
             return
-        for start in range(0, updates.shape[0], self.attn_chunk_size):
-            end = min(start + self.attn_chunk_size, updates.shape[0])
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                cache, slot_mapping[start:end], updates[start:end]
+        num_chunks = max(1, round(updates.shape[0] / base_chunk_size))
+        chunk_size = (updates.shape[0] + num_chunks - 1) // num_chunks
+        logger.debug(
+            "_chunked_scatter: updates.shape[0]=%d, chunk_size=%d, "
+            "base_chunk_size=%d, compress_ratio=%d, num_chunks=%d",
+            updates.shape[0], chunk_size,
+            base_chunk_size, compress_ratio, num_chunks,
+        )
+        for start in range(0, updates.shape[0], chunk_size):
+            end = min(start + chunk_size, updates.shape[0])
+            DeviceOperator.dsa_kv_compress_scatter(
+                cache, updates[start:end], slot_mapping[start:end]
             )
 
     def _compute_compressor_metadata(
@@ -1384,6 +1400,15 @@ class AscendDSACPImpl(DSAAttentionImpl):
         local_seq_lengths_key = cp_metadata.local_seq_lens
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
+        logger.debug(
+            "_forward[%s]: need_gather_q_kv=%s, hidden_states_local.shape[0]=%d, "
+            "hidden_states.shape[0]=%d, num_actual_tokens=%d, has_prefill=%s, "
+            "enable_attn_chunking=%s, attn_chunk_size=%d, compress_ratio=%d",
+            layer_name, need_gather_q_kv, hidden_states_local.shape[0],
+            hidden_states.shape[0], common_attn_metadata.num_actual_tokens,
+            has_prefill, self.enable_attn_chunking, self.attn_chunk_size,
+            self.compress_ratio,
+        )
 
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
             self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
@@ -1456,7 +1481,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
-        self._chunked_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping, prefill=has_prefill)
+        self._chunked_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping, prefill=has_prefill, compress_ratio=1)
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
