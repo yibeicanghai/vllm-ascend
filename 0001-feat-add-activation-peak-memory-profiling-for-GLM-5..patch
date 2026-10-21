@@ -1,0 +1,2669 @@
+From 60c4155d7863f7ac0f1d95bdf30e3c9267d05538 Mon Sep 17 00:00:00 2001
+From: lvjunmao <lvjunmao@huawei.com>
+Date: Wed, 21 Oct 2026 16:27:08 +0800
+Subject: [PATCH] feat: add activation peak memory profiling for GLM-5.2
+
+- Port activation_memory.py from v0.23 with absolute-peak sorting
+- Add activation_peak_debug / activation_peak_debug_rank config fields
+- Instrument target_model, target_layer, target_attn_sfa, target_moe_routed,
+  target_logits scopes across model_runner, patched forward, SFA, MoE
+- Silent during collection; single summary report at session end
+- Requires enforce_eager=true (NPU sync incompatible with ACLGraph)
+
+Signed-off-by: opencode <opencode@example.com>
+Signed-off-by: lvjunmao <lvjunmao@huawei.com>
+---
+ .../glm52_peak_memory_profiling_guide.md      |  412 ++++++
+ .../glm5_next_framework_code_paths.md         |  369 ++++++
+ .../glm5_next_model_structure_analysis.md     | 1151 +++++++++++++++++
+ vllm_ascend/activation_memory.py              |  356 +++++
+ vllm_ascend/ascend_config.py                  |   25 +
+ vllm_ascend/attention/sfa_v1.py               |   90 +-
+ vllm_ascend/models/deepseek_mtp.py            |    1 +
+ vllm_ascend/ops/fused_moe/fused_moe.py        |   22 +-
+ vllm_ascend/patch/worker/patch_deepseek_v2.py |    4 +-
+ vllm_ascend/worker/model_runner_v1.py         |   34 +-
+ 10 files changed, 2399 insertions(+), 65 deletions(-)
+ create mode 100644 docs/analysis/glm52_peak_memory_profiling_guide.md
+ create mode 100644 docs/analysis/glm5_next_framework_code_paths.md
+ create mode 100644 docs/analysis/glm5_next_model_structure_analysis.md
+ create mode 100644 vllm_ascend/activation_memory.py
+
+diff --git a/docs/analysis/glm52_peak_memory_profiling_guide.md b/docs/analysis/glm52_peak_memory_profiling_guide.md
+new file mode 100644
+index 000000000..f04161b4c
+--- /dev/null
++++ b/docs/analysis/glm52_peak_memory_profiling_guide.md
+@@ -0,0 +1,412 @@
++# GLM-5.2 模型 Forward 峰值显存统计点位分析报告
++
++> 基于 vllm-ascend v0.30.0，分析 GLM-5.2（`glm_moe_dsa`）在关闭 MTP 投机解码后的
++> forward 执行路径，给出峰值显存统计的插桩文件范围和说明。
++
++---
++
++## 一、服务配置
++
++```bash
++export HCCL_BUFFSIZE=768
++export HCCL_OP_EXPANSION_MODE="AIV"
++export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++
++vllm serve <MODEL_PATH> \
++  --seed 1024 \
++  --host 0.0.0.0 --port 8000 \
++  --served-model-name glm-52 \
++  --max-model-len 1024000 \
++  --max-num-batched-tokens 16384 \
++  --gpu-memory-utilization 0.80 \
++  --max-num-seqs 32 \
++  --tensor-parallel-size 16 \
++  --decode-context-parallel-size 16 \
++  --cp-kv-cache-interleave-size 128 \
++  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [4, 16, 128]}' \
++  --kv-cache-dtype int8 \
++  --attention_config.indexer_kv_dtype int8 \
++  --additional-config '{"enable_flashcomm1": true, "enable_dsa_cp": true, "ascend_compilation_config": {"enable_npugraph_ex": true, "enable_static_kernel": false}, "fuse_muls_add": true, "multistream_overlap_shared_expert": true, "enable_mc2_hierarchy_comm": false, "enable_cpu_binding": true, "weight_nz_mode": 1}' \
++  --quantization ascend \
++  --enable-expert-parallel \
++  --safetensors-load-strategy prefetch
++# 注意：已移除 --speculative-config（关闭 MTP 投机解码）
++```
++
++### 配置触发的执行分支
++
++| 配置项 | 值 | 触发的分支 | 代码位置 |
++|---|---|---|---|
++| `enable_dsa_cp` | true | **强制 v1 runner**（v2 不兼容 DSA-CP） | `ascend_config.py:703-707` |
++| `enable_dsa_cp` | true | **自动启用 FlashComm1** → 启用 SP-MoE | `ascend_config.py:752-756` |
++| v1 + SP-MoE + DSA-CP | — | `model_cls = AscendDSACPModel` | `deepseek_mtp.py:232-237` |
++| `decode_context_parallel_size` | 16 | DCP=16，KV cache 在 16 rank 间分片 | — |
++| `kv-cache-dtype` | int8 | KV cache INT8 存储 | `patch_kv_cache_dtype.py:94` |
++| `indexer_kv_dtype` | int8 | Indexer K cache INT8 | `patch_indexer_kv_dtype.py:89` |
++| `cudagraph_mode` | FULL_DECODE_ONLY | decode 用 FULL 图，prefill eager | — |
++| `quantization` | ascend | W4A8 量化（AscendModelSlimConfig） | — |
++| `weight_nz_mode` | 1 | 权重 NZ 格式 | — |
++| `multistream_overlap_shared_expert` | true | 共享专家独立流重叠 | — |
++| 无 `--speculative-config` | — | 无 MTP draft，无 verify batch | — |
++
++### 算子选择
++
++KV cache dtype=int8 → `get_dsa_attn_kv_plan()`（`dsa_attn_kv_plan.py:215-273`）：
++
++```
++① TurboQuant INT4? → No
++② 旧硬件 fallback? → No (A3 支持 DSv4)
++③ BF16 KV? → No (是 int8)
++④ 默认 → mixed_quant_sparse_flash_mla_fp8  ★ 使用的 sparse attention 算子
++   + uses_kv_compress_epilog=True (用 cann_ops_transformer.kv_compress_epilog 写 INT8 KV)
++```
++
++---
++
++## 二、Forward 执行路径（关闭 MTP）
++
++```
++NPUModelRunner.forward()                                    ← worker/model_runner_v1.py
++  → AscendGlmMoeDsaForCausalLM.forward()                    ← models/deepseek_mtp.py:230
++    → super().forward() → 上游 GlmMoeDsaForCausalLM
++      → self.model = AscendDSACPModel (因 v1+SP+DSA-CP)     ← models/deepseek_mtp.py:138
++        → _patched_forward()                                 ← patch/worker/patch_deepseek_v2.py:384
++          → embed_input_ids(input_ids)                       ← 上游 VocabParallelEmbedding
++          → for idx, layer in layers:                        ← L426-432, 78 层循环
++              → AscendDSACPDecoderLayer.forward()            ← models/deepseek_mtp.py:99
++                ① input_layernorm(hidden, residual)
++                ② self.self_attn(positions, hidden)          ← 上游 DeepseekV2MLAAttention
++                   → fused_qkv_a_proj (Q+KV 投影)
++                   → q_a_layernorm + q_b_proj (Q 上投影)
++                   → Indexer top-k (full 层计算, shared 层跳过) ← attention/indexer.py
++                   → mixed_quant_sparse_flash_mla_fp8        ← dsa_attn_kv_plan.py:261-273
++                     (sparse MLA attention, INT8 KV, DSA-CP)
++                   → o_proj (输出投影, SP 不 reduce)
++                ③ post_attention_layernorm(attn_out, residual)
++                ④ self.mlp(hidden, already_sp=True)          ← DeepseekV2MoE
++                   → gate (路由 256 选 8)
++                   → AscendMoERunner.forward()               ← ops/fused_moe/fused_moe.py:161
++                     → routed_experts (SP 分片 + FlashComm1) ← ops/fused_moe/routed_experts.py
++                     → shared_experts (multistream overlap)  ← ops/fused_moe/shared_experts.py
++                     → routed + shared 合并
++                     → all_reduce (SP 收尾)
++                ⑤ [如需] gather_sequence_parallel_output (all_gather)
++          → self.norm(hidden, residual)                      ← RMSNorm
++          → lm_head + logits_processor                        ← 上游 ParallelLMHead
++```
++
++---
++
++## 三、Decoder Layer 内部细粒度划分
++
++### 3.1 AscendDSACPDecoderLayer.forward 执行流程
++
++源码：`models/deepseek_mtp.py:99-134`
++
++```python
++def forward(self, positions, hidden_states, residual, llama_4_scaling=None):
++    if not self.input_is_sequence_parallel or ...:
++        # 非SP路径（前几层或特殊配置）
++        hidden_states, residual = super().forward(...)  # 上游 DeepseekV2DecoderLayer.forward
++    else:
++        # SP路径（大多数层）
++        # ① input_layernorm
++        hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        # ② attention (SP 模式)
++        hidden_states = self.self_attn.mla_attn.forward_sequence_parallel(
++            positions, hidden_states, output_scale=output_scale)
++        # ③ post_attention_layernorm
++        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        # ④ MoE (SP 分片)
++        hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
++    # ⑤ SP 收尾（如需）
++    if self.gather_sequence_parallel_output:
++        combined = tensor_model_parallel_all_gather(...)
++        ...
++    return hidden_states, residual
++```
++
++### 3.2 Attention 内部细粒度划分
++
++上游 `DeepseekV2MLAAttention`（`__init__` 被 `patch_deepseek_v2.py:67` 替换）内部流程：
++
++| 子步骤 | 操作 | 张量形状 (decode, N=1, TP=16) | 张量形状 (prefill, N=16384) |
++|---|---|---|---|
++| a. fused_qkv_a_proj | hidden→[cq, ckv] | [1, 2048] + [1, 576] | [N, 2048] + [N, 576] |
++| b. q_a_layernorm | RMSNorm(cq) | [1, 2048] | [N, 2048] |
++| c. q_b_proj | cq→Q[heads, qk_dim] | [4, 256, 192] | [N, 4, 256, 192] |
++| d. kv_a_layernorm | RMSNorm(ckv) | [1, 576] | [N, 576] |
++| e. KV cache 写入 | ckv→cache (INT8, kv_compress_epilog) | [1, 608B] | [N, 608B] |
++| f. Indexer top-k | (full 层) 选 top-2048 KV block | [1, 2048] int32 | [N, 2048] int32 |
++| g. SFA attention | Q × selected_KV → output | [1, 4, 256, 256] | [N, 4, 256, 256] |
++| h. o_proj | output→hidden | [1, 6144] (SP 不 reduce) | [N, 6144] (SP 不 reduce) |
++
++注：TP=16 → 64 heads / 16 = 4 local heads。DCP=16 → 每个 DCP rank 只持有 1/16 的 KV cache。
++
++### 3.3 MoE 内部细粒度划分
++
++`AscendMoERunner.forward`（`ops/fused_moe/fused_moe.py:161-245`）：
++
++| 子步骤 | 操作 | 张量形状 (decode, N=1, 8 experts) | 张量形状 (prefill, N=16384) |
++|---|---|---|---|
++| a. routed_input_transform | (如有) 投影 | [1, 6144] | [N, 6144] |
++| b. _maybe_pad_hidden_states | 对齐 hidden_dim | [1, 6144] | [N, 6144] |
++| c. _forward_entry | gate 路由 + expert 计算 | gate: [1, 256] → top-8 | gate: [N, 256] → top-8 |
++| d. routed_experts | 8 个 expert 的 gate_up + down | [8, 1, 2048] → [1, 6144] | [8, N/16, 2048] → [N/16, 6144] |
++| e. shared_experts | 1 个共享专家 (multistream overlap) | [1, 2048] → [1, 6144] | [N/16, 2048] → [N/16, 6144] |
++| f. routed + shared 合并 | add | [1, 6144] | [N/16, 6144] |
++| g. all_reduce | SP 收尾 (如需) | [1, 6144] | [N, 6144] |
++
++---
++
++## 四、需要修改的文件范围
++
++### 4.1 P0：必须修改（覆盖主要显存热点）
++
++| 序号 | 文件 | 行号 | 函数/位置 | 插桩内容 | 为什么需要 |
++|---|---|---|---|---|---|
++| 1 | `worker/model_runner_v1.py` | forward 方法 | `NPUModelRunner.forward` | forward 前 `torch.npu.reset_peak_memory()`，后 `torch.npu.max_memory_allocated()` | 顶层控制：重置峰值、汇总结果 |
++| 2 | `patch/worker/patch_deepseek_v2.py` | L426-432 | `_patched_forward` 中的层循环 | 每层前后 `torch.npu.memory_allocated()` + `torch.npu.max_memory_allocated()` | 78 层循环的唯一入口，记录每层峰值 |
++| 3 | `models/deepseek_mtp.py` | L99-134 | `AscendDSACPDecoderLayer.forward` | attention 前后、MoE 前后记录显存 | SP 模式 decoder 层，能看到子层边界 |
++| 4 | `ops/fused_moe/fused_moe.py` | L161-245 | `AscendMoERunner.forward` | `_forward_entry` 前后、shared_experts 前后、all_reduce 前后记录 | MoE expert 中间激活是显存热点 |
++| 5 | `attention/sfa_v1.py` | SFA 执行方法 | sparse MLA 调用处 | `mixed_quant_sparse_flash_mla_fp8` 调用前后记录 | sparse attention 的 Q×topk_K 是峰值热点 |
++
++### 4.2 P1：推荐修改（覆盖 DSA-CP 和 Indexer 细节）
++
++| 序号 | 文件 | 行号 | 函数/位置 | 插桩内容 | 为什么需要 |
++|---|---|---|---|---|---|
++| 6 | `attention/context_parallel/dsa_cp.py` | L1397+ | `AscendDSACPImpl` | indexer K all-gather 前后记录 | DSA-CP 跨 TP all-gather indexer K 是额外开销 |
++| 7 | `attention/context_parallel/sfa_cp.py` | L2033+ | `AscendSFADSADCPImpl` | DSA-CP 元数据构建前后、sparse attention 前后记录 | DSA-CP + DCP 路径的 sparse MLA 执行 |
++| 8 | `attention/indexer.py` | Indexer forward | top-k 选择方法 | K pool 写入前后、top-k 选择前后记录 | INT8 indexer K pool + top-2048 选择 |
++| 9 | `attention/dsa_attn_kv_plan.py` | L179-212 | `dsa_kv_compress_scatter` | `kv_compress_epilog` 调用前后记录 | INT8 KV cache 写入（量化压缩） |
++
++### 4.3 P2：可选修改（覆盖更细粒度）
++
++| 序号 | 文件 | 行号 | 函数/位置 | 插桩内容 | 为什么需要 |
++|---|---|---|---|---|---|
++| 10 | `attention/sfa_v1.py` | L940-988 | `process_weights_after_loading` | 权重预处理后记录 | W_UK_T、W_UV 预处理后的显存 |
++| 11 | `ops/fused_moe/routed_experts.py` | forward | `AscendRoutedExperts.forward` | expert GEMM 前后记录 | 256 expert 的 GEMM 中间张量 |
++| 12 | `ops/fused_moe/shared_experts.py` | forward | `AscendSharedExperts.forward` | shared expert 前后记录 | 共享专家中间激活 |
++| 13 | `worker/model_runner_v1.py` | 采样方法 | `NPUModelRunner._sample` | logits_processor 前后记录 | lm_head + logits 的显存（vocab=154880） |
++
++---
++
++## 五、插桩代码示例
++
++### 5.1 顶层控制（文件 1）
++
++```python
++# worker/model_runner_v1.py — NPUModelRunner.forward 方法中
++def forward(self, ...):
++    torch.npu.reset_peak_memory()          # 重置峰值统计
++    mem_start = torch.npu.memory_allocated()
++    
++    # ... 原有 forward 逻辑 ...
++    
++    mem_end = torch.npu.memory_allocated()
++    mem_peak = torch.npu.max_memory_allocated()
++    logger.info(
++        f"[MEM] forward: start={mem_start//1024//1024}MB "
++        f"end={mem_end//1024//1024}MB peak={mem_peak//1024//1024}MB"
++    )
++```
++
++### 5.2 层循环（文件 2）
++
++```python
++# patch/worker/patch_deepseek_v2.py — _patched_forward 中 L426-432
++for idx, layer in enumerate(
++    islice(self.layers, self.start_layer, self.end_layer),
++    start=self.start_layer,
++):
++    mem_before = torch.npu.memory_allocated()
++    torch.npu.reset_peak_memory()           # 每层重置峰值
++    
++    hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
++    
++    mem_after = torch.npu.memory_allocated()
++    mem_peak = torch.npu.max_memory_allocated()
++    logger.info(
++        f"[MEM] Layer {idx}: before={mem_before//1024//1024}MB "
++        f"after={mem_after//1024//1024}MB peak={mem_peak//1024//1024}MB "
++        f"delta={(mem_peak-mem_before)//1024//1024}MB"
++    )
++    _capture_aux_hidden_state(self, aux_hidden_states, idx + 1, hidden_states, residual, positions)
++```
++
++### 5.3 Decoder Layer 子层（文件 3）
++
++```python
++# models/deepseek_mtp.py — AscendDSACPDecoderLayer.forward L99-134
++def forward(self, positions, hidden_states, residual, llama_4_scaling=None):
++    mem = {}
++    mem['start'] = torch.npu.memory_allocated()
++    
++    if not self.input_is_sequence_parallel or ...:
++        hidden_states, residual = super().forward(...)
++    else:
++        hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        mem['pre_attn'] = torch.npu.memory_allocated()
++        torch.npu.reset_peak_memory()
++        
++        hidden_states = self.self_attn.mla_attn.forward_sequence_parallel(
++            positions, hidden_states, output_scale=output_scale)
++        
++        mem['post_attn'] = torch.npu.memory_allocated()
++        mem['attn_peak'] = torch.npu.max_memory_allocated()
++        
++        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        mem['pre_moe'] = torch.npu.memory_allocated()
++        torch.npu.reset_peak_memory()
++        
++        hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
++        
++        mem['post_moe'] = torch.npu.memory_allocated()
++        mem['moe_peak'] = torch.npu.max_memory_allocated()
++    
++    if self.gather_sequence_parallel_output:
++        combined = tensor_model_parallel_all_gather(...)
++        ...
++    
++    logger.info(f"[MEM] Layer{self.layer_idx}: "
++                f"attn_peak={mem.get('attn_peak',0)//1024//1024}MB "
++                f"moe_peak={mem.get('moe_peak',0)//1024//1024}MB")
++    return hidden_states, residual
++```
++
++### 5.4 MoE 内部（文件 4）
++
++```python
++# ops/fused_moe/fused_moe.py — AscendMoERunner.forward L161-245
++def forward(self, hidden_states, router_logits, input_ids=None, shared_experts_input=None):
++    mem = {}
++    mem['start'] = torch.npu.memory_allocated()
++    
++    if shared_experts_input is None:
++        hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
++    
++    hidden_states, _, _ = self._maybe_pad_hidden_states(shared_experts_input, hidden_states)
++    mem['pre_entry'] = torch.npu.memory_allocated()
++    
++    result = self._forward_entry(hidden_states, router_logits, shared_experts_input, ...)
++    
++    mem['post_entry'] = torch.npu.memory_allocated()
++    shared_output, fused_output = _unpack(result)
++    
++    # ... routed/shared reduce ...
++    
++    fused_output = self.apply_routed_output_transform(fused_output)
++    mem['post_xform'] = torch.npu.memory_allocated()
++    
++    # ... combine + reduce ...
++    
++    mem['end'] = torch.npu.memory_allocated()
++    logger.info(f"[MEM] MoE L{self._encode_layer_name()}: "
++                f"entry_delta={(mem['post_entry']-mem['pre_entry'])//1024//1024}MB "
++                f"total_peak={max(mem.values())//1024//1024}MB")
++    return self._maybe_add_zero_expert_output(result)
++```
++
++### 5.5 SFA Attention（文件 5）
++
++```python
++# attention/sfa_v1.py — sparse_mla 函数 L168 附近，或 AscendSFAImpl 的 forward
++def sparse_mla(query, cache, indices, metadata, scale):
++    mem_before = torch.npu.memory_allocated()
++    
++    # ... metadata 构建 ...
++    
++    result = mixed_quant_sparse_flash_mla_fp8(     # 实际的 INT8 sparse MLA 算子
++        query=query.contiguous(),
++        kv_cache=cache,
++        sparse_indices=sorted_indices,
++        ...
++    )
++    
++    mem_after = torch.npu.memory_allocated()
++    logger.info(f"[MEM] SFA: delta={(mem_after-mem_before)//1024//1024}MB")
++    return result[0]
++```
++
++---
++
++## 六、预期峰值显存热点分析
++
++### 6.1 各阶段显存估算（Prefill, N=16384, TP=16, DCP=16, INT8 KV）
++
++| 阶段 | 张量 | 形状 | 显存 |
++|---|---|---|---|
++| Embedding | embed 输出 | [16384, 6144] × 2B | 192 MB |
++| MLA Q 投影 | fused_qkv_a_proj 输出 | [16384, 2048+576] × 2B | 85 MB |
++| MLA Q 上投影 | q_b_proj 输出 | [16384/16, 4, 256, 192] × 2B | 6 MB (SP 分片) |
++| Indexer K pool | K pool | [16384/16, 32, 128] × 1B (INT8) | 4 MB |
++| **SFA attention score** | Q × topk_K^T | **[16384/16, 4, 2048, 192] × 2B** | **~1.5 GB** ★ |
++| SFA attention output | softmax × V | [16384/16, 4, 256, 256] × 2B | 24 MB |
++| o_proj 输出 | attention→hidden | [16384/16, 6144] × 2B | 12 MB (SP 不 reduce) |
++| MoE gate | router logits | [16384, 256] × 4B (fp32) | 16 MB |
++| **MoE routed expert 中间** | gate_up 输出 | **[16384/16, 8, 2048] × 2B** | **32 MB** |
++| MoE shared expert | 中间 | [16384/16, 2048] × 2B | 4 MB |
++| MoE 合并 + reduce | output | [16384, 6144] × 2B | 192 MB |
++| logits | lm_head 输出 | [16384, 154880] × 2B | **~4.8 GB** ★ |
++
++### 6.2 峰值热点排序
++
++| 排名 | 阶段 | 显存 | 文件 | 行号 |
++|---|---|---|---|---|
++| **1** | **logits (lm_head)** | ~4.8 GB | `worker/model_runner_v1.py` | 采样方法 |
++| **2** | **SFA attention score** | ~1.5 GB | `attention/sfa_v1.py` | L201/L224 |
++| **3** | Embedding 输出 | 192 MB | `patch/worker/patch_deepseek_v2.py` | L398 |
++| **4** | MoE 合并 + reduce | 192 MB | `ops/fused_moe/fused_moe.py` | L237-243 |
++| **5** | MLA Q 投影 | 85 MB | 上游 `DeepseekV2MLAAttention` | — |
++
++**关键发现**：
++- Prefill 阶段（N=16384）的峰值显存在 **lm_head logits**（~4.8 GB），因为 vocab=154880 很大
++- Decode 阶段（N=1~128）的峰值显存在 **SFA attention score**，因为 top-2048 × head_dim 的 attention 矩阵
++- DCP=16 将 KV cache 分片到 16 个 rank，每个 rank 只持有 1/16 的 KV，降低了 SFA 的显存
++- SP-MoE 将 token 分片到 16 个 TP rank，降低了 MoE 的显存
++
++### 6.3 Decode vs Prefill 的峰值差异
++
++| 阶段 | Decode (N=1) | Prefill (N=16384) |
++|---|---|---|
++| SFA score | 4 × 2048 × 192 × 2B = 3 MB | 1024 × 4 × 2048 × 192 × 2B ≈ 1.5 GB |
++| MoE expert | 8 × 1 × 2048 × 2B = 32 KB | 8 × 1024 × 2048 × 2B ≈ 32 MB |
++| logits | 1 × 154880 × 2B = 0.3 MB | 16384 × 154880 × 2B ≈ 4.8 GB |
++
++- **Decode 峰值**：SFA attention score（受 DCP 分片影响，实际很小）或 KV cache 本身
++- **Prefill 峰值**：lm_head logits（4.8 GB）>> SFA score（1.5 GB）>> 其他
++
++---
++
++## 七、完整文件修改清单
++
++| 优先级 | 文件路径 | 修改位置 | 插桩点 | 目标 |
++|---|---|---|---|---|
++| P0 | `worker/model_runner_v1.py` | forward 方法 | 前后 | 顶层峰值汇总 |
++| P0 | `patch/worker/patch_deepseek_v2.py` | L426-432 | 层循环前后 | 每层峰值 |
++| P0 | `models/deepseek_mtp.py` | L99-134 | attention 前后、MoE 前后 | 子层峰值 |
++| P0 | `ops/fused_moe/fused_moe.py` | L161-245 | _forward_entry 前后、shared 前后 | MoE 内部峰值 |
++| P0 | `attention/sfa_v1.py` | sparse_mla / SFA forward | sparse attention 调用前后 | attention 峰值 |
++| P1 | `attention/context_parallel/dsa_cp.py` | L1397+ | indexer K all-gather 前后 | DSA-CP 开销 |
++| P1 | `attention/context_parallel/sfa_cp.py` | L2033+ | DSA-CP+DCP attention 前后 | DSA-CP attention 峰值 |
++| P1 | `attention/indexer.py` | Indexer forward | K pool 写入、top-k 选择前后 | indexer 峰值 |
++| P1 | `attention/dsa_attn_kv_plan.py` | L179-212 | kv_compress_epilog 前后 | INT8 KV 写入 |
++| P2 | `ops/fused_moe/routed_experts.py` | forward | expert GEMM 前后 | routed expert 细粒度 |
++| P2 | `ops/fused_moe/shared_experts.py` | forward | shared expert 前后 | shared expert 细粒度 |
++| P2 | `worker/model_runner_v1.py` | _sample 方法 | logits_processor 前后 | logits 峰值 |
++
++---
++
++## 八、注意事项
++
++1. **ACLGraph 捕获**：`cudagraph_mode=FULL_DECODE_ONLY` 意味着 decode 阶段走图重放。在图捕获期间不能调用 `torch.npu.memory_allocated()`（会同步）。需要在 eager 模式下运行，或使用 `torch.npu.max_memory_allocated()`（异步安全）。
++
++2. **DCP=16 的影响**：每个 DCP rank 只持有 1/16 的 KV cache。SFA attention 的显存按 1/16 缩减。但 indexer K 的 all-gather 会在 DSA-CP 路径中跨 TP rank 汇聚。
++
++3. **SP-MoE 的影响**：token 在 16 个 TP rank 间分片。MoE expert 的中间激活按 1/16 缩减。但 all-reduce 收尾时会有临时全量张量。
++
++4. **INT8 KV cache**：`kv_compress_epilog` 将 BF16 的 kv_lora_rank (512) + rope (64) 压缩为 INT8 格式（608 B/token），减少了 KV cache 占用。
++
++5. **weight_nz_mode=1**：权重以 NZ 格式存储，`process_weights_after_loading` 中会做格式转换（`maybe_trans_nz`），这发生在加载阶段而非 forward 阶段。
++
++6. **关闭 MTP 的影响**：不加载 `AscendDeepSeekMTP` draft 模型，不执行 K 步 draft forward，不执行 verify batch。Forward 只有一次 target 前向（1 token decode 或 N token prefill），峰值显存由 target 模型单独决定。
+diff --git a/docs/analysis/glm5_next_framework_code_paths.md b/docs/analysis/glm5_next_framework_code_paths.md
+new file mode 100644
+index 000000000..055a82185
+--- /dev/null
++++ b/docs/analysis/glm5_next_framework_code_paths.md
+@@ -0,0 +1,369 @@
++# GLM-5.2 模型在 vllm-ascend 中的框架层次与代码路径指南
++
++> 基于 vllm-ascend v0.30.0，分析 GLM-5.2（代码中称 Glm5Next / GLM-5.3-Flash）在推理框架中的完整层次结构，
++> 区分 vllm-ascend 适配工作与上游 vllm 复用部分，提供代码修改定位指南。
++
++---
++
++## 一、框架层次总览
++
++```mermaid
++graph TB
++    subgraph "上游 vLLM (复用)"
++        V1["vllm.v1.worker.gpu_model_runner<br/>调度与执行框架"]
++        V2["vllm.model_executor.layers.*<br/>通用层: RMSNorm, Linear, Embedding, MoE"]
++        V3["vllm.model_executor.models.deepseek_v2<br/>DeepseekV2MLAAttention, DeepseekV2MoE"]
++        V4["vllm.model_executor.models.glm4_1v<br/>Glm4vForConditionalGeneration"]
++        V5["vllm.model_executor.layers.mla<br/>MultiHeadLatentAttentionWrapper"]
++        V6["vllm.model_executor.layers.mamba<br/>GatedDeltaNetAttention, MambaState*"]
++        V7["vllm.config.speculative<br/>SpeculativeConfig, MTPSpeculator"]
++        V8["vllm.v1.worker.gpu.spec_decode.*<br/>MTPSpeculator, DSparkSpeculator, AutoRegressiveSpeculator"]
++    end
++    
++    subgraph "vllm-ascend 适配层"
++        A1["模型实现<br/>vllm_ascend/models/glm5next/"]
++        A2["注意力后端<br/>vllm_ascend/attention/"]
++        A3["自定义算子<br/>vllm_ascend/ops/triton/glm5_next_*"]
++        A4["Patch 层<br/>vllm_ascend/patch/"]
++        A5["KV Cache 布局<br/>vllm_ascend/models/glm5next/kv_cache.py"]
++        A6["投机解码适配<br/>vllm_ascend/worker/v2/spec_decode/"]
++        A7["编译/图<br/>vllm_ascend/compilation/"]
++        A8["平台配置<br/>vllm_ascend/platform.py"]
++    end
++    
++    subgraph "Ascend NPU 硬件"
++        N1["Ascend A3 (910B/910C)<br/>AIV 向量核 + AIC 计算核"]
++        N2["CANN 算子库<br/>key_pool, pool_key_indexer"]
++    end
++    
++    V1 --> A1
++    V2 --> A1
++    V3 --> A1
++    V4 --> A1
++    V5 --> A2
++    V6 --> A2
++    V7 --> A6
++    V8 --> A6
++    A1 --> A2
++    A1 --> A3
++    A2 --> A3
++    A1 --> A5
++    A4 --> V1
++    A4 --> V2
++    A4 --> V7
++    A3 --> N1
++    A3 --> N2
++```
++
++---
++
++## 二、vllm-ascend 做的工作 vs 复用 vllm 的工作
++
++### 2.1 vllm-ascend 独立实现的工作
++
++| 层次 | 文件路径 | 做了什么 |
++|---|---|---|
++| **模型架构** | `models/glm5next/model.py` | `Glm5NextDecoderLayer`（KDA/MLA 分发 + mHC 流程）、`Glm5NextModel`、`Glm5NextForCausalLM`、`Glm5NextForConditionalGeneration` |
++| **配置定义** | `models/glm5next/config.py` | `Glm5NextTextConfig`（MLA+MoE+KDA+indexer+mHC 全部字段）、`Glm5NextConfig`（嵌套 text+vision） |
++| **MLA 注意力** | `models/glm5next/attention.py` | `Glm5NextMLAAttention`（封装 MLA wrapper + Indexer）、`Indexer`（kpool 投影 + 压缩缓存） |
++| **KDA 线性注意力** | `models/glm5next/kda.py` | `Glm5NextLinearAttention`（6合1 GEMM + AscendC causal_conv1d + chunk/recurrent KDA） |
++| **mHC 超连接** | `models/glm5next/model.py:362-548` | `hc_pre`/`hc_post`/`hc_post_pre` 调用 `npu_hc_pre_v2`/`npu_hc_post` |
++| **MoE** | `models/glm5next/model.py:141-264` | `Glm5NextMoE`（288专家 + shared + sequence parallel） |
++| **KV Cache 三层布局** | `models/glm5next/kv_cache.py` | `Glm5NextIndexerCache`（压缩KV池）、`Glm5NextTailCache`（FP32环）、`KpoolTailManager` |
++| **Cache 分组规划** | `models/glm5next/cache_config.py` | `_Glm5NextCacheLayout`、`get_glm5_next_kv_cache_groups`（主MLA+压缩indexer+tail 三组） |
++| **Cache 物理视图** | `models/glm5next/cache_views.py` | `view_glm5_next_cache`（分发压缩indexer/tail/NoPE-MLA 视图） |
++| **MTP draft** | `models/glm5next/mtp.py` | `Glm5NextMTP`、`Glm5NextMultiTokenPredictorLayer`、index cache 跨步复用 |
++| **DSpark draft** | `models/glm5_dspark.py` | `Glm5DSparkForCausalLM`、`Glm5DSparkModel`（MLA backbone + Markov head） |
++| **多模态** | `models/glm5next/multimodal.py` | Vision Transformer + PatchMerger + ProcessingInfo |
++| **Processor** | `models/glm5next/processor.py` | `Glm5NextImageProcessor`、`Glm5NextVideoProcessor` |
++| **自定义算子** | `models/glm5next/ops/` | `causal_conv1d`、`kda(recurrent/chunk)`、`mhc_ops`、`state_ops` |
++| **Triton 算子** | `ops/triton/glm5_next_*.py` | CANN keypool 元数据、lightning indexer、tail compress |
++| **注意力后端** | `attention/indexer_kpool.py` | `Glm5NextKPoolIndexerBackend`（CANN keypool + tail） |
++| **SFA 后端** | `attention/sfa_v1.py` | `is_mtp_layer` 感知、`skip_topk` 路由、MTP top-k 复用 |
++| **GDN 后端** | `ops/gdn_attn_builder.py` | `AscendGDNHostMetadataBackend`（KDA 的 host 元数据构建） |
++| **Patch: Config 注册** | `patch/platform/patch_glm5next_config.py` | 注册 `Glm5NextConfig` 到 `_CONFIG_REGISTRY`；`is_deepseek_mla` 扩展 |
++| **Patch: Spec config** | `patch/platform/patch_speculative_config.py` | `glm5_next` → `glm5_next_mtp` 重映射；DSpark MLA 恢复 |
++| **Patch: KV cache** | `patch/platform/patch_kv_cache_utils.py` | 分发到 `get_glm5_next_kv_cache_groups` |
++| **Patch: DeepseekV2** | `patch/worker/patch_deepseek_v2.py` | Indexer 构造条件 + `skip_topk` 与 `is_mtp_layer` 联动 |
++| **Patch: Triton KDA** | `patch/worker/patch_triton.py` | 将 KDA 入口重绑定到 NPU 实现 |
++| **编译黑名单** | `compilation/compiler_interface.py:139,141` | 黑名单 `QuantBatchMatmulV3`(910C)、`QuantLightningIndexer`(950) |
++
++### 2.2 复用上游 vLLM 的工作
++
++| 层次 | 上游来源 | 复用方式 |
++|---|---|---|
++| **MLA 注意力核心** | `vllm.model_executor.layers.mla.MLAModules` + `MultiHeadLatentAttentionWrapper` | `Glm5NextMLAAttention` 组装 `MLAModules` 并传入 wrapper |
++| **MLA 投影层** | `vllm.model_executor.models.deepseek_v2.DeepSeekV2FusedQkvAProjLinear` | `Glm5NextMLAAttention` 直接使用 |
++| **MoE 工厂** | `vllm.model_executor.layers.fused_moe.FusedMoEFactory` | `Glm5NextMoE` 调用 `FusedMoEFactory` |
++| **MoE 路由** | `vllm.model_executor.layers.fused_moe.GateLinear` | `Glm5NextMoE` 使用 |
++| **KDA 基类** | `vllm.model_executor.layers.mamba.gdn.base.GatedDeltaNetAttention` | `Glm5NextLinearAttention` 继承 |
++| **Mamba 状态** | `vllm.model_executor.layers.mamba.mamba_utils.MambaState*Calculator` | KDA 的 conv/recurrent state 形状/dtype/copy 计算 |
++| **多模态基类** | `vllm.model_executor.models.glm4_1v.Glm4vForConditionalGeneration` | `Glm5NextForConditionalGeneration` 继承 |
++| **RMSNorm** | `vllm.model_executor.layers.layernorm.RMSNorm` | 全模型使用 |
++| **Linear** | `vllm.model_executor.layers.linear.ColumnParallelLinear` 等 | 全模型使用 |
++| **Embedding** | `vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding` | 全模型使用 |
++| **RoPE** | `vllm.model_executor.layers.rotary_embedding.get_rope` | MLA attention 使用 |
++| **MTP Speculator** | `vllm.v1.worker.gpu.spec_decode.mtp.speculator.MTPSpeculator` | `AscendMTPSpeculator` 继承 |
++| **DSpark Speculator** | `vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator` | `AscendDSparkSpeculator` 继承 |
++| **AutoRegressive** | `vllm.v1.worker.gpu.spec_decode.autoregressive.speculator.AutoRegressiveSpeculator` | `AscendAutoRegressiveSpeculator` 继承 |
++| **Rejection Sampler** | `vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils` | Ascend 重写 kernel 但接口复用 |
++| **Weight Loader** | `vllm.model_executor.model_loader.weight_utils.default_weight_loader` | 权重加载工具 |
++| **SharedHead** | `vllm.model_executor.models.deepseek_mtp.SharedHead` | MTP 的 `shared_head` 直接复用 |
++| **DSpark Markov/Confidence** | `vllm.model_executor.models.qwen3_dspark.DSparkMarkovHead`/`DSparkConfidenceHead` | `Glm5DSparkForCausalLM` 继承使用 |
++| **Model Runner 框架** | `vllm.v1.worker.gpu_model_runner.GPUModelRunner` | Ascend `NPUModelRunner` 继承 |
++| **Scheduler** | `vllm.v1.core.sched.scheduler.Scheduler` | 直接复用（通过 patch 增强） |
++| **Compilation** | `vllm.compilation.decorators.support_torch_compile` | 模型类使用 `@support_torch_compile` |
++
++---
++
++## 三、代码结构与路径详解
++
++### 3.1 模型组图搭建代码
++
++**核心文件：`vllm_ascend/models/glm5next/model.py`**
++
++| 行号 | 类/函数 | 职责 |
++|---|---|---|
++| L551 | `Glm5NextModel.__init__` | 构建 embed_tokens + 45 层 decoder + norm |
++| L591-599 | `get_layer` 工厂 | 每层创建 `Glm5NextDecoderLayer`，传入 `layer_idx` |
++| L601-605 | `make_layers` | 调用上游 `make_layers` 构建 `self.layers` |
++| L267-385 | `Glm5NextDecoderLayer.__init__` | 根据 `layer_types[i]` 分发 KDA vs MLA；根据 `mlp_layer_types[i]` 分发 Dense vs MoE；初始化 mHC 参数 |
++| L386-488 | `Glm5NextDecoderLayer.forward` | mHC 流程：hc_pre → attention → hc_post_pre → mlp → hc_post/defer |
++| L839-914 | `Glm5NextForCausalLM` | text-only 模型入口，含 `lm_head` + `logits_processor` |
++| L922-1030 | `Glm5NextForConditionalGeneration` | 多模态入口，组合 vision tower + text model |
++
++### 3.2 注意力层构建代码
++
++| 文件 | 行号 | 类 | 职责 |
++|---|---|---|---|
++| `models/glm5next/attention.py` | L140-327 | `Glm5NextMLAAttention` | MLA 注意力：fused_qkv_a_proj + kv_b_proj + indexer + MLA wrapper |
++| `models/glm5next/attention.py` | L39-137 | `Indexer` | 稀疏索引器：wq_b + wk_weights_proj + kpool 压缩缓存 |
++| `models/glm5next/kda.py` | L108-540 | `Glm5NextLinearAttention` | KDA 线性注意力：6合1投影 + conv1d + recurrent/chunk |
++| `attention/sfa_v1.py` | L852-854 | SFA 后端 | `is_mtp_layer` 判断 + `skip_topk` 路由 |
++| `attention/indexer_kpool.py` | L484+ | `Glm5NextKPoolIndexerBackend` | CANN keypool 后端实现 |
++
++### 3.3 权重加载代码
++
++| 文件 | 行号 | 职责 |
++|---|---|---|
++| `models/glm5next/model.py:712-836` | `Glm5NextModel.load_weights` | 主模型权重：stacked mapping (gate_up, fused_qkv, wk_weights, in_proj_qkvbfg_a) + expert mapping |
++| `models/glm5next/model.py:930-947` | `hf_to_vllm_mapper` | 多模态权重前缀映射 + ModelSlim W8A8 子串映射 |
++| `models/glm5next/model.py:1033-1041` | `get_spec_layer_idx_from_weight_name` | MTP 层权重索引识别 |
++| `models/glm5next/model.py:1044-1071` | `_try_load_fp8_indexer_wk` | FP8 indexer wk 反量化 |
++| `models/glm5next/mtp.py:294-409` | `Glm5NextMTP.load_weights` | MTP 权重：stacked + expert + FP8 wk + multimodal 前缀 |
++| `models/glm5_dspark.py:230-260` | `Glm5DSparkForCausalLM.load_weights` | DSpark 权重：d2t/t2d 映射 + final_norm 重命名 |
++
++### 3.4 KV Cache 布局代码
++
++| 文件 | 行号 | 类/函数 | 职责 |
++|---|---|---|---|
++| `models/glm5next/kv_cache.py:68-126` | `Glm5NextIndexerCache` | 压缩 indexer KV 池（kpool:1 压缩比） |
++| `models/glm5next/kv_cache.py:129-180` | `Glm5NextTailCache` | FP32 不完整池尾环 |
++| `models/glm5next/cache_config.py:33-454` | `_Glm5NextCacheLayout` + 分组逻辑 | 三组 cache 规划（主MLA + 压缩indexer + tail） |
++| `models/glm5next/cache_views.py:115` | `view_glm5_next_cache` | 物理视图分发入口 |
++
++### 3.5 投机解码代码
++
++| 文件 | 行号 | 类 | 职责 |
++|---|---|---|---|
++| `models/glm5next/mtp.py:200-410` | `Glm5NextMTP` | MTP draft 模型（同一 checkpoint） |
++| `models/glm5next/mtp.py:39-104` | `Glm5NextMultiTokenPredictorLayer` | 单个 MTP 层（fused_eh_norm + decoder + shared_head） |
++| `models/glm5_dspark.py:177-260` | `Glm5DSparkForCausalLM` | DSpark draft 模型（独立 checkpoint） |
++| `worker/v2/spec_decode/mtp/speculator.py:25` | `AscendMTPSpeculator` | MTP speculator（v2） |
++| `worker/v2/spec_decode/dspark/speculator.py:58` | `AscendDSparkSpeculator` | DSpark speculator（v2） |
++| `worker/v2/spec_decode/autoregressive/speculator.py:71` | `AscendAutoRegressiveSpeculator` | 共享 draft 循环（MTP/Eagle 基类） |
++| `spec_decode/__init__.py:41-70` | `get_spec_decode_method` | v1 spec decode 方法分发 |
++| `worker/v2/spec_decode/__init__.py:25-78` | `init_speculator` | v2 speculator 分发 |
++| `patch/platform/patch_speculative_config.py:99-107` | `hf_config_override` | `glm5_next` → `glm5_next_mtp` 重映射 |
++| `patch/platform/patch_speculative_config.py:212-230` | `_normalize_glm_mla_dspark` | DSpark MLA 架构恢复 |
++
++### 3.6 Patch 层代码
++
++| Patch 文件 | 修改的上游目标 | 对 GLM-5.2 的作用 |
++|---|---|---|
++| `patch/platform/patch_glm5next_config.py` | `_CONFIG_REGISTRY` + `ModelConfig.is_deepseek_mla` | 注册 GLM config；让 MLA 路径生效 |
++| `patch/platform/patch_speculative_config.py` | `SpeculativeConfig.hf_config_override` + `__post_init__` | MTP/DSpark config 归一化 |
++| `patch/platform/patch_kv_cache_utils.py` | `get_kv_cache_groups` + `get_kv_cache_config` | 分发到 GLM cache 分组逻辑 |
++| `patch/platform/patch_kv_cache_coordinator.py` | `KVCacheCoordinator` | 混合 Mamba + MLA 块丢弃策略 |
++| `patch/platform/patch_mamba_block_aligned_split.py` | 调度器 prefill 分块 | 对齐 sparse indexer prefill 边界 |
++| `patch/worker/patch_deepseek_v2.py` | `DeepseekV2MLAAttention.__init__` | Indexer 构造条件 + MTP 层 `skip_topk` 联动 |
++| `patch/worker/patch_triton.py` | KDA 入口函数 | 重绑定到 NPU KDA 实现 |
++| `patch/worker/patch_v2/patch_dspark.py` | `load_dspark_model` | DSpark draft 量化配置继承 |
++| `patch/worker/patch_v2/patch_eagle_speculator.py` | `SpeculatorCudaGraphManager` | 替换为 Ascend ACLGraph |
++
++### 3.7 编译/图捕获代码
++
++| 文件 | 行号 | 职责 |
++|---|---|---|
++| `compilation/compiler_interface.py:139` | 黑名单 `QuantBatchMatmulV3` | GLM-5.2 在 910C 上不静态编译此算子 |
++| `compilation/compiler_interface.py:141` | 黑名单 `QuantLightningIndexer` | GLM-5.2 在 950 上不静态编译此算子 |
++| `compilation/acl_graph.py` | ACLGraph 管理 | 图捕获与重放 |
++| `worker/v2/spec_decode/autoregressive/aclgraph.py:41` | `AutoRegressiveAclGraphManager` | MTP/Eagle draft 图管理 |
++
++---
++
++## 四、按修改目的定位代码文件
++
++### 4.1 "我要修改模型结构/层定义"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 decoder layer 结构 | `models/glm5next/model.py` | `Glm5NextDecoderLayer` L267 |
++| 修改 KDA 层 | `models/glm5next/kda.py` | `Glm5NextLinearAttention` L108 |
++| 修改 MLA 注意力 | `models/glm5next/attention.py` | `Glm5NextMLAAttention` L140 |
++| 修改 Indexer 稀疏选择 | `models/glm5next/attention.py` | `Indexer` L39 |
++| 修改 mHC 超连接 | `models/glm5next/model.py` | L362-548 |
++| 修改 MoE 配置 | `models/glm5next/model.py` | `Glm5NextMoE` L141 |
++| 修改 Dense MLP | `models/glm5next/model.py` | `Glm5NextMLP` L90 |
++| 修改配置字段 | `models/glm5next/config.py` | `Glm5NextTextConfig` L7 |
++| 修改层类型分发 | `models/glm5next/config.py` | `is_kda_layer` L230, `layer_types` L165 |
++
++### 4.2 "我要修改注意力后端/执行逻辑"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 SFA 稀疏 MLA 执行 | `attention/sfa_v1.py` | `AscendSFABackend` |
++| 修改 MLA NoPE 执行 | `attention/mla_v1.py` | `AscendMLABackend` |
++| 修改 kpool indexer 后端 | `attention/indexer_kpool.py` | `Glm5NextKPoolIndexerBackend` L484 |
++| 修改 KDA/GDN 后端 | `ops/gdn_attn_builder.py` | `AscendGDNHostMetadataBackend` |
++| 修改 MTP 的 skip_topk 路由 | `attention/sfa_v1.py` | L852-854, L907-914 |
++| 修改 DCP 下的 indexer | `attention/context_parallel/dsa_cp.py` | L1896, L2930 |
++
++### 4.3 "我要修改 KV Cache"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 cache 分组 | `models/glm5next/cache_config.py` | `_create_glm5_next_attention_groups` L120 |
++| 修改 cache spec | `models/glm5next/kv_cache.py` | `Glm5NextIndexerCache` L68 |
++| 修改物理视图 | `models/glm5next/cache_views.py` | `view_glm5_next_cache` L115 |
++| 修改 tail ring 容量 | `models/glm5next/kv_cache.py` | `get_kpool_tail_ring_capacity` L28 |
++| 修改 memory 计算 | `models/glm5next/cache_config.py` | `get_glm5_next_max_memory_usage` L437 |
++
++### 4.4 "我要修改投机解码"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 MTP draft 层 | `models/glm5next/mtp.py` | `Glm5NextMultiTokenPredictorLayer` L39 |
++| 修改 MTP speculator | `worker/v2/spec_decode/mtp/speculator.py` | `AscendMTPSpeculator` |
++| 修改 DSpark draft | `models/glm5_dspark.py` | `Glm5DSparkModel` L68 |
++| 修改 DSpark speculator | `worker/v2/spec_decode/dspark/speculator.py` | `AscendDSparkSpeculator` L58 |
++| 修改 draft 循环 | `worker/v2/spec_decode/autoregressive/speculator.py` | `AscendAutoRegressiveSpeculator` L71 |
++| 修改 spec config 重映射 | `patch/platform/patch_speculative_config.py` | L99-107 (MTP), L212-230 (DSpark) |
++| 修改 speculator 分发 | `worker/v2/spec_decode/__init__.py` | `init_speculator` L25 |
++| 修改 rejection sampling | `worker/v2/spec_decode/rejection_sampler_utils.py` | `rejection_sample` L209 |
++| 修改 Markov head | `models/glm5_dspark.py` | (继承 `DSparkMarkovHead`，在上游) |
++
++### 4.5 "我要修改权重加载"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改主模型权重映射 | `models/glm5next/model.py` | `load_weights` L712, `stacked_params_mapping` L713 |
++| 修改多模态前缀映射 | `models/glm5next/model.py` | `hf_to_vllm_mapper` L930 |
++| 修改 MTP 权重加载 | `models/glm5next/mtp.py` | `load_weights` L294 |
++| 修改 DSpark 权重加载 | `models/glm5_dspark.py` | `load_weights` L230 |
++| 修改 FP8 indexer wk | `models/glm5next/model.py` | `_try_load_fp8_indexer_wk` L1044 |
++| 修改 spec layer 识别 | `models/glm5next/model.py` | `get_spec_layer_idx_from_weight_name` L1033 |
++
++### 4.6 "我要修改自定义算子"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 causal conv1d | `models/glm5next/ops/causal_conv1d.py` | `causal_conv1d` L12 |
++| 修改 KDA 核心 | `models/glm5next/ops/kda.py` | `recurrent_kda` L14, `chunk_kda` L56 |
++| 修改 mHC shape ops | `models/glm5next/ops/mhc_ops.py` | `hc_expand`/`hc_contract` |
++| 修改 state scatter | `models/glm5next/ops/state_ops.py` | `scatter_states` |
++| 修改 CANN keypool 元数据 | `ops/triton/glm5_next_cann_keypool.py` | `build_keypool_metadata` |
++| 修改 lightning indexer | `ops/triton/glm5_next_lightning_indexer.py` | `glm5_next_lightning_indexer_triton` |
++| 修改 tail compress | `ops/triton/glm5_next_kpool_tail_compress.py` | `glm5_next_kpool_tail_compress_and_write_cache_triton` |
++| 修改 fused eh norm | `ops/triton/linearnorm/fused_eh_norm.py` | MTP 输入投影融合 |
++| 修改 KDA Triton kernel | `ops/triton/kda/` | `kda.py`, `gate.py`, `output_writeback.py` |
++
++### 4.7 "我要修改多模态"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 vision tower | `models/glm5next/multimodal.py` | `Glm5NextVisionTransformer` L333 |
++| 修改 patch merger | `models/glm5next/multimodal.py` | `Glm5NextPatchMerger` L281 |
++| 修改 image processor | `models/glm5next/processor.py` | `Glm5NextImageProcessor` L327 |
++| 修改 video processor | `models/glm5next/processor.py` | `Glm5NextVideoProcessor` L525 |
++| 修改 multimodal 入口 | `models/glm5next/model.py` | `Glm5NextForConditionalGeneration` L922 |
++
++### 4.8 "我要修改 Patch/上游兼容"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改 config 注册 | `patch/platform/patch_glm5next_config.py` | 全文件 |
++| 修改 spec config | `patch/platform/patch_speculative_config.py` | 全文件 |
++| 修改 KV cache 分发 | `patch/platform/patch_kv_cache_utils.py` | `get_kv_cache_groups` 替换 |
++| 修改 MLA Indexer 构造 | `patch/worker/patch_deepseek_v2.py` | `DeepseekV2MLAAttention.__init__` |
++| 修改 KDA Triton 入口 | `patch/worker/patch_triton.py` | KDA 入口重绑定 |
++| 修改 speculator 图管理 | `patch/worker/patch_v2/patch_eagle_speculator.py` | `SpeculatorCudaGraphManager` 替换 |
++
++### 4.9 "我要修改编译/图"
++
++| 修改目的 | 文件 | 关键位置 |
++|---|---|---|
++| 修改编译黑名单 | `compilation/compiler_interface.py` | L139, L141 |
++| 修改 ACLGraph 管理 | `compilation/acl_graph.py` | 全文件 |
++| 修改 draft 图管理 | `worker/v2/spec_decode/autoregressive/aclgraph.py` | `AutoRegressiveAclGraphManager` L41 |
++
++---
++
++## 五、模型注册到执行的完整调用链
++
++```
++用户启动: vllm serve GLM-5.2 --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
++
++1. Config 加载
++   ├─ transformers 读 config.json → Glm5NextConfig (patch_glm5next_config.py 注册)
++   ├─ SpeculativeConfig.__post_init__ (patch_speculative_config.py)
++   │   ├─ hf_config_override: glm5_next → glm5_next_mtp + Glm5NextMTPModel
++   │   └─ _normalize_glm_mla_dspark (如果 DSpark)
++   └─ ModelConfig.is_deepseek_mla → True (patch_glm5next_config.py)
++
++2. 模型注册查找
++   └─ ModelRegistry → models/__init__.py:97 → "Glm5NextMTPModel" → Glm5NextMTP
++
++3. 模型加载
++   ├─ target: Glm5NextForCausalLM (或 ForConditionalGeneration)
++   │   └─ model.py: Glm5NextModel → make_layers(45, Glm5NextDecoderLayer)
++   │       └─ 每层: is_kda_layer(i) → KDA or MLA + Dense or MoE
++   └─ draft: Glm5NextMTP
++       └─ mtp.py: Glm5NextMultiTokenPredictor → ModuleDict(layers)
++
++4. KV Cache 分配
++   ├─ patch_kv_cache_utils.py → is_glm5_next_cache_spec → True
++   ├─ cache_config.py: get_glm5_next_kv_cache_groups
++   │   └─ 三组: 主MLA组 + 压缩indexer组 + tail组
++   └─ model_runner_v1.py: view_glm5_next_cache → 物理视图
++
++5. 推理执行 (每步)
++   ├─ Target forward: input_ids → embed → 45层(KDA/MLA+mHC+MoE) → norm → hidden
++   ├─ MTP propose: target_hidden → MTP层(eh_proj+decoder+shared_head) × K步 → draft_tokens
++   ├─ Target verify: [bonus, draft_0..K-1] → 1次causal forward → K+1 logits
++   └─ Rejection sampling: target_logits vs draft_logits → accepted + bonus
++
++6. ACLGraph 捕获 (可选)
++   ├─ compilation/compiler_interface.py: 黑名单检查
++   ├─ patch_eagle_speculator.py: SpeculatorCudaGraphManager → AutoRegressiveAclGraphManager
++   └─ acl_graph.py: FULL/PIECEWISE 图捕获
++```
++
++---
++
++## 六、关键设计决策总结
++
++| 设计点 | vllm-ascend 做的 | 为什么 |
++|---|---|---|
++| KDA/MLA 混合层分发 | `Glm5NextDecoderLayer.__init__` 按 `layer_types[i]` 分发 | 上游不支持 KDA + MLA 混合 |
++| kpool 压缩 indexer | `Indexer` + `Glm5NextIndexerCache` | 上游 MLA 无 kpool 压缩 |
++| mHC 多残差流 | `hc_pre`/`hc_post` + `npu_hc_pre_v2` 算子 | 上游无 mHC 支持 |
++| KDA AscendC 实现 | `ops/triton/kda/` + `patch_triton.py` 重绑定 | 上游 KDA 用 Triton x86，NPU 不兼容 |
++| CANN keypool | `ops/triton/glm5_next_cann_keypool.py` | NPU CANN 专有算子 |
++| 三层 KV cache | `kv_cache.py` + `cache_config.py` + `cache_views.py` | 上游不支持压缩 indexer + tail ring |
++| MTP index 复用 | `mtp.py: set_skip_topk`/`compact_topk_indices` | 上游 MTP 无 sparse index 复用 |
++| GLM config 注册 | `patch_glm5next_config.py` | 上游 `_CONFIG_REGISTRY` 无 GLM config |
++| `is_deepseek_mla` 扩展 | `patch_glm5next_config.py` | 让 MLA 注意力路径对 GLM 生效 |
++| spec config 重映射 | `patch_speculative_config.py` | 上游不识别 `glm5_next` → MTP 映射 |
++| DSpark MLA 恢复 | `_normalize_glm_mla_dspark` | Speculators 转换擦除了 MLA 架构 |
++| 编译黑名单 | `compiler_interface.py` | 2 个算子在 NPU 不支持静态编译 |
+diff --git a/docs/analysis/glm5_next_model_structure_analysis.md b/docs/analysis/glm5_next_model_structure_analysis.md
+new file mode 100644
+index 000000000..1b9a3e197
+--- /dev/null
++++ b/docs/analysis/glm5_next_model_structure_analysis.md
+@@ -0,0 +1,1151 @@
++# GLM-5.2 (Glm5Next) 模型结构分析报告
++
++> 基于 vllm-ascend v0.30.0 代码仓，分析 GLM-5.2（代码中称为 Glm5Next / GLM-5.3-Flash）的完整模型结构。
++> 源码位于 `vllm_ascend/models/glm5next/`。
++
++---
++
++## 一、总体架构概览
++
++GLM-5.2 是一个**混合架构（Hybrid）模型**，融合了三种注意力机制和两种 FFN 结构，并通过多残差流超连接（mHC）替代标准残差连接。
++
++### 1.1 关键配置参数
++
++来源：`vllm_ascend/models/glm5next/config.py:7-209`
++
++| 参数 | 默认值 | 说明 |
++|---|---|---|
++| `num_hidden_layers` | **45** | 主模型层数（测试配置为 9） |
++| `hidden_size` | 4096 | 隐藏维度 |
++| `vocab_size` | 154880 | 词表大小 |
++| `num_attention_heads` | 64 | MLA 注意力头数 |
++| `q_lora_rank` | 1536 | Q 低秩投影维度 |
++| `kv_lora_rank` | 512 | KV 低秩投影维度 |
++| `qk_nope_head_dim` | 256 | NoPE 头维度 |
++| `qk_rope_head_dim` | 0 | RoPE 头维度（GLM-5.2 中 mla_nope=True，无 RoPE） |
++| `v_head_dim` | 256 | V 头维度 |
++| `n_routed_experts` | 288 | 路由专家数 |
++| `num_experts_per_token` | 7~8 | 每 token 选取专家数 |
++| `n_shared_experts` | 1 | 共享专家数 |
++| `moe_intermediate_size` | 2048 | 每专家中间维度 |
++| `mhc_num_residual_streams` | 4 | mHC 残差流数 |
++| `num_nextn_predict_layers` | 1 | MTP 预测层数 |
++
++### 1.2 模型整体结构
++
++```mermaid
++graph TB
++    subgraph "Glm5NextForConditionalGeneration"
++        VT["Vision Transformer<br/>(Glm5NextVisionTransformer)<br/>depth=24, hidden=1024"]
++        PM["PatchMerger<br/>spatial_merge=2"]
++        
++        subgraph "Glm5NextForCausalLM (Text Model)"
++            EMB["VocabParallelEmbedding<br/>vocab=154880, hidden=4096"]
++            
++            subgraph "Glm5NextModel (45 layers)"
++                L0["Layer 0: KDA + Dense MLP<br/>(linear_attention)"]
++                L1["Layer 1: KDA + Dense MLP"]
++                L2["Layer 2: KDA + Dense MLP"]
++                L3["Layer 3: MLA + MoE<br/>(deepseek_sparse_attention)"]
++                L4["Layer 4: KDA + MoE"]
++                dots["... (layers 5 ~ 42)"]
++                L43["Layer 43: MLA + MoE<br/>(deepseek_sparse_attention)"]
++                L44["Layer 44: KDA + MoE"]
++                NORM["RMSNorm"]
++            end
++            
++            LM_HEAD["ParallelLMHead<br/>(lm_head)"]
++        end
++        
++        VT --> PM --> EMB
++        EMB --> L0 --> L1 --> L2 --> L3 --> L4 --> dots --> L43 --> L44 --> NORM --> LM_HEAD
++    end
++    
++    subgraph "MTP (num_nextn_predict_layers=1)"
++        MTP0["Glm5NextMTP<br/>(speculative decoding)"]
++    end
++    
++    LM_HEAD -.->|"hidden_states"| MTP0
++```
++
++### 1.3 层类型分布（以 9 层测试配置为例）
++
++来源：`tests/e2e/pull_request/four_card/glm53flash_assets/config.json`
++
++```mermaid
++graph LR
++    subgraph "Layer Types (9-layer test config)"
++        L0["L0: KDA<br/>Dense"]
++        L1["L1: KDA<br/>Dense"]
++        L2["L2: KDA<br/>Dense"]
++        L3["L3: MLA-Sparse<br/>MoE"]
++        L4["L4: KDA<br/>MoE"]
++        L5["L5: KDA<br/>MoE"]
++        L6["L6: KDA<br/>MoE"]
++        L7["L7: MLA-Sparse<br/>MoE"]
++        L8["L8: KDA<br/>MoE"]
++    end
++    
++    L0 --> L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7 --> L8
++```
++
++生产级 45 层模型遵循相同模式：**大量 KDA 线性注意力层（低延迟、O(N) 复杂度）+ 少量 MLA 稀疏注意力层（高精度、O(N×topk) 复杂度）周期性穿插**。
++
++- KDA 层（`layer_types = "linear_attention"`）：~7/9 ≈ 78%
++- MLA 稀疏层（`layer_types = "deepseek_sparse_attention"`）：~2/9 ≈ 22%
++- Dense MLP 层（`mlp_layer_types = "dense"`）：前 3 层
++- MoE 层（`mlp_layer_types = "sparse"`）：其余层
++
++代码中层类型判断（`config.py:230-235`）：
++```python
++def is_kda_layer(self, layer_idx: int):
++    return (
++        self.layer_types is not None
++        and layer_idx < len(self.layer_types)
++        and self.layer_types[layer_idx] == "linear_attention"
++    )
++```
++
++Decoder layer 构建逻辑（`model.py:295-322`）：
++```python
++if config.is_kda_layer(layer_idx):
++    self.self_attn = Glm5NextLinearAttention(...)  # KDA 线性注意力
++else:
++    self.self_attn = Glm5NextMLAAttention(...)     # MLA 稀疏注意力
++
++# MLP 选择（model.py:328-350）
++mlp_type = mlp_layer_types[layer_idx] if layer_idx < len(mlp_layer_types) else "sparse"
++if self.is_moe and mlp_type == "sparse":
++    self.mlp = Glm5NextMoE(...)    # MoE
++else:
++    self.mlp = Glm5NextMLP(...)    # Dense MLP
++```
++
++---
++
++## 二、Attention 结构
++
++GLM-5.2 采用**混合注意力架构**，包含两种注意力类型。
++
++### 2.1 KDA（Gated Delta Net）线性注意力
++
++源码：`vllm_ascend/models/glm5next/kda.py:108-540`
++
++KDA 是一种**线性注意力**机制，基于 Gated Delta Net，具有 O(N) 的序列复杂度和递归状态（recurrent state），适合处理长序列。
++
++```mermaid
++graph TB
++    subgraph "Glm5NextLinearAttention (KDA)"
++        IN["in_proj_qkvbfg_a<br/>6-in-1 GEMM<br/>q|k|v|b|f_a|g_a"]
++        
++        IN -->|"qkv [N, 3*H*D]"| CONV["Merged Causal Conv1d<br/>kernel=4, q|k|v merged"]
++        IN -->|"f_a [N, D]"| FB["f_b_proj<br/>D → H*D"]
++        IN -->|"g_a [N, D]"| GB["g_b_proj<br/>D → H*D"]
++        IN -->|"b [N, H]"| BETA["beta (gate)"]
++        
++        CONV -->|"q', k', v'"| REC["Recurrent / Chunk KDA<br/>linear attention core"]
++        FB -->|"g1 [1, N, H, D]"| REC
++        BETA -->|"beta [1, N, H]"| REC
++        
++        REC -->|"core_attn_out [1, N, H, D]"| ONORM["o_norm<br/>FusedRMSNormGated(sigmoid)"]
++        GB -->|"g2 [N, H, D]"| ONORM
++        
++        ONORM -->|"gated output"| OPROJ["o_proj<br/>H*D → hidden_size"]
++    end
++    
++    HS["hidden_states [N, 4096]"] --> IN
++    OPROJ --> OUT["output [N, 4096]"]
++```
++
++**关键组件说明**：
++
++| 组件 | 代码位置 | 说明 |
++|---|---|---|
++| `in_proj_qkvbfg_a` | `kda.py:172-187` | 6 合 1 融合投影：q, k, v, b(beta gate), f_a, g_a。6 个 GEMM 合为 1 次 |
++| `q/k/v_conv1d` | `kda.py:200-227` | 短卷积（kernel=4），合并为 1 次 conv1d 调用 |
++| `A_log` | `kda.py:232` | 可学习衰减率（log 空间），head_dim=128 |
++| `f_b_proj` / `g_b_proj` | `kda.py:189-241` | 投影门控向量 g1（输入门）和 g2（输出门） |
++| `o_norm` | `kda.py:242` | FusedRMSNormGated，sigmoid 门控 + RMSNorm |
++| `dt_bias` | `kda.py:196` | 门控偏置，FP32 |
++| `kda_lower_bound` | `kda.py:266` | 有界 sigmoid 门下界（-5.0），替代默认 softplus |
++
++**KDA 核心计算**（`kda.py:322-540`）：
++- **Prefill（chunk）模式**：`chunk_kda()` 分块计算，处理长 prefill 序列
++- **Decode（recurrent）模式**：`recurrent_kda()` 逐 token 递归更新状态
++- **投机解码支持**：spec tokens 携带 `num_spec+1` 列递归状态，支持 `num_accepted_tokens` 回滚
++- **状态缓存**：`(conv_state, recurrent_state)` 对，conv_state 形状 `[batch, H, D, kernel]`，recurrent_state 形状 `[batch, H, D, D]`
++
++KDA 配置（`config.py:57-60`）：
++```python
++linear_head_dim: int = 128          # 每头维度
++linear_num_heads: int = 64          # 头数
++linear_conv_kernel_dim: int = 4     # 短卷积核大小
++linear_lower_bound: float = -5.0    # 门控下界
++```
++
++### 2.2 MLA 稀疏注意力（DeepSeek Sparse Attention）
++
++源码：`vllm_ascend/models/glm5next/attention.py:140-327`
++
++非 KDA 层使用 **MLA（Multi-head Latent Attention）** + **KPool Indexer 稀疏选择**，结构与 DeepSeek-V3/V4 的 MLA 一致，但额外引入了 sparse indexer 进行 top-k KV block 选择。
++
++```mermaid
++graph TB
++    subgraph "Glm5NextMLAAttention"
++        FQKV["fused_qkv_a_proj<br/>hidden → [q_lora=1536, kv_lora=512]"]
++        
++        FQKV -->|"cq [N, 1536]"| QANORM["q_a_layernorm<br/>RMSNorm"]
++        QANORM --> QB["q_b_proj<br/>1536 → 64*(256+0)=16384"]
++        QB --> Q["q [N, 64, 256]"]
++        
++        FQKV -->|"ckv [N, 512]"| KVANORM["kv_a_layernorm<br/>RMSNorm"]
++        KVANORM --> KVB["kv_b_proj<br/>512 → 64*(256+256)=32768"]
++        KVB --> KV["kv [N, 64, 256+256]"]
++        
++        subgraph "Indexer (sparse selection)"
++            IDX_WQ["wq_b<br/>1536 → 32*128"]
++            IDX_WK["wk_weights_proj<br/>fused: wk + weights_proj"]
++            IDX_KCACHE["Glm5NextIndexerCache<br/>kpool=4 compression"]
++            IDX_TAIL["Glm5NextTailCache<br/>incomplete pool ring"]
++            
++            IDX_WQ --> IDX_Q["indexer q [N, 32, 128]"]
++            IDX_WK --> IDX_K["indexer k [N, 128]"]
++            IDX_KCACHE --> IDX_SELECT["Top-K selection<br/>topk=2048"]
++            IDX_TAIL --> IDX_SELECT
++            IDX_Q --> IDX_SELECT
++            IDX_K --> IDX_SELECT
++        end
++        
++        IDX_SELECT -->|"topk_indices"| MLA["Sparse MLA Attention<br/>select top-k KV blocks"]
++        Q --> MLA
++        KV -->|"KV cache"| MLA
++        MLA --> OPROJ_MLA["o_proj<br/>64*256 → 4096"]
++    end
++    
++    HS2["hidden_states [N, 4096]"] --> FQKV
++    HS2 --> IDX_WQ
++    HS2 --> IDX_WK
++    OPROJ_MLA --> OUT2["output [N, 4096]"]
++```
++
++**MLA 关键参数**：
++
++| 参数 | 值 | 说明 |
++|---|---|---|
++| `q_lora_rank` | 1536 | Q 低秩压缩维度 |
++| `kv_lora_rank` | 512 | KV 低秩压缩维度（KV cache 只存 512 维） |
++| `qk_nope_head_dim` | 256 | NoPE 注意力头维度 |
++| `qk_rope_head_dim` | 0 | RoPE 维度（`mla_nope=True`，无 RoPE） |
++| `v_head_dim` | 256 | V 头维度 |
++| `num_attention_heads` | 64 | 注意力头数 |
++
++**Indexer 稀疏选择**（`attention.py:39-137`）：
++
++| 组件 | 说明 |
++|---|---|
++| `index_n_heads` | 32 个索引头 |
++| `index_head_dim` | 128 维 |
++| `index_topk` | 2048（选择 top-2048 个 KV block） |
++| `index_kpool` | 4（每 4 个 token 的 K 压缩为 1 个存储） |
++| `kpool_compress_ape` | 可学习位置编码 [4, 128] |
++| `kpool_compress_gate` | 压缩门控 [128, 4096] |
++| `Glm5NextIndexerCache` | 压缩 KV 池，BF16，压缩比 4:1 |
++| `Glm5NextTailCache` | 请求级 FP32 环，保存不完整 pool |
++
++MLA 注意力本身是标准 DeepSeek MLA（`attention.py:285-316`），通过 `MultiHeadLatentAttentionWrapper` 包装，`fuse_qkv_rmsnorm=True` 融合 QKV 投影与 RMSNorm。
++
++### 2.3 两种注意力对比
++
++```mermaid
++graph LR
++    subgraph "KDA Layer (78%)"
++        K1["O(N) 复杂度"]
++        K2["递归状态<br/>conv + recurrent"]
++        K3["无 KV cache<br/>有 mamba state"]
++        K4["短序列高效"]
++        K5["长序列线性增长"]
++    end
++    
++    subgraph "MLA-Sparse Layer (22%)"
++        M1["O(N × topk) 复杂度"]
++        M2["KV cache + top-k 选择"]
++        M3["kpool 4:1 压缩"]
++        M4["长序列精度高"]
++        M5["topk=2048 sparse"]
++    end
++    
++    K1 --- M1
++    K2 --- M2
++    K3 --- M3
++```
++
++---
++
++## 三、FFN 结构
++
++### 3.1 Dense MLP（SwiGLU）
++
++源码：`vllm_ascend/models/glm5next/model.py:90-138`
++
++用于前几层（`first_k_dense_replace=3`），结构简单：
++
++```mermaid
++graph LR
++    IN["input [N, 4096]"] --> GU["gate_up_proj<br/>MergedColumnParallelLinear<br/>4096 → [12288, 12288]"]
++    GU --> ACT["SiluAndMulWithClamp<br/>(swiglu_limit=10)"]
++    ACT --> DOWN["down_proj<br/>RowParallelLinear<br/>12288 → 4096"]
++    DOWN --> OUT["output [N, 4096]"]
++```
++
++- `intermediate_size = 12288`（3× hidden_size）
++- `hidden_act = "silu"`（SwiGLU 激活）
++- `swiglu_limit = 10`（激活值上限，防止溢出）
++- 支持序列并行（`is_sequence_parallel`）
++
++### 3.2 MoE（Mixture of Experts）
++
++源码：`vllm_ascend/models/glm5next/model.py:141-264`
++
++用于大部分层（`mlp_layer_types = "sparse"`），采用 DeepSeek 式 MoE：
++
++```mermaid
++graph TB
++    IN["input [N, 4096]"] --> GATE["gate (GateLinear)<br/>4096 → 288<br/>sigmoid scoring"]
++    IN --> SE["shared_experts (Glm5NextMLP)<br/>intermediate=2048×1=2048<br/>always active"]
++    IN --> EXP["experts (FusedMoEFactory)<br/>288 experts, top-8<br/>intermediate=2048 per expert"]
++    
++    GATE -->|"router_logits"| EXP
++    SE --> ADD["+ add"]
++    EXP --> ADD
++    ADD --> OUT["output [N, 4096]"]
++```
++
++**MoE 关键参数**：
++
++| 参数 | 值 | 说明 |
++|---|---|---|
++| `n_routed_experts` | 288 | 路由专家总数 |
++| `num_experts_per_token` | 7~8 | 每 token 激活专家数 |
++| `n_shared_experts` | 1 | 共享专家（始终激活） |
++| `moe_intermediate_size` | 2048 | 每专家中间维度 |
++| `scoring_func` | "sigmoid" | 路由评分函数 |
++| `topk_method` | "noaux_tc" | 带辅助修正的 top-k |
++| `routed_scaling_factor` | 2.5 | 路由缩放因子 |
++| `use_grouped_topk` | True | 分组 top-k |
++| `moe_renormalize` | True | 概率归一化 |
++
++**序列并行 MoE**（`model.py:162, 242-264`）：
++- `is_sequence_parallel=True` 时，输入在 TP rank 间分片
++- Gate 和 expert 计算在分片上执行，避免重复计算
++- 输出通过 `tensor_model_parallel_all_gather` 合并
++
++---
++
++## 四、mHC（多残差流超连接）
++
++源码：`vllm_ascend/models/glm5next/model.py:362-548`，`ops/mhc_ops.py`
++
++GLM-5.2 用 **mHC（multi-Head Hyper Connection）** 替代标准的残差连接，将每层扩展为 4 条并行残差流。
++
++### 4.1 mHC 结构
++
++```mermaid
++graph TB
++    subgraph "mHC (mhc_num_residual_streams=4)"
++        EXPAND["hc_expand<br/>[N, 4096] → [N, 4×4096]<br/>(replication)"]
++        
++        subgraph "Layer i"
++            HCPRE_ATTN["hc_pre (attn)<br/>npu_hc_pre_v2<br/>Sinkhorn 20 iters"]
++            ATTN["Self-Attention<br/>(KDA or MLA)"]
++            HCPOSTPRE_ATTN["hc_post_pre (ffn)<br/>post + pre fused"]
++            FFN["MLP / MoE"]
++        end
++        
++        subgraph "Layer i+1"
++            HCPRE_ATTN2["hc_pre (attn)"]
++            ATTN2["Self-Attention"]
++            HCPOSTPRE2["hc_post_pre (ffn)"]
++            FFN2["MLP / MoE"]
++        end
++        
++        EXPAND --> HCPRE_ATTN
++        HCPRE_ATTN -->|"layer_input"| ATTN
++        HCPRE_ATTN -->|"post_mix, res_mix"| HCPOSTPRE_ATTN
++        ATTN --> HCPOSTPRE_ATTN
++        HCPOSTPRE_ATTN -->|"layer_input"| FFN
++        HCPOSTPRE_ATTN -->|"post, comb, residual"| HCPRE_ATTN2
++        FFN --> HCPRE_ATTN2
++        
++        HCPOSTPRE2 --> CONTRACT
++        FFN2 --> HCPOSTPRE2
++    end
++    
++    CONTRACT["hc_contract<br/>[N, 4×4096] → [N, 4096]<br/>(averaging)"]
++```
++
++### 4.2 mHC 核心操作
++
++| 操作 | 代码位置 | 说明 |
++|---|---|---|
++| `hc_expand` | `mhc_ops.py:13-15` | `[N, H] → [N, n×H]`，复制扩展 |
++| `hc_contract` | `mhc_ops.py:18-19` | `[N, n×H] → [N, H]`，均值收缩 |
++| `hc_pre` | `model.py:490-514` | 调用 `npu_hc_pre_v2`：Sinkhorn 归一化（20 次迭代）+ post_mix / res_mix 计算 + RMSNorm |
++| `hc_post` | `model.py:516-525` | 调用 `npu_hc_post`：延迟的 post 混合 |
++| `hc_post_pre` | `model.py:527-548` | 融合 post + pre：先执行前一层的延迟 post，再执行当前层的 pre |
++
++**mHC 参数**（`config.py:72-79`）：
++
++| 参数 | 值 | 说明 |
++|---|---|---|
++| `mhc_num_residual_streams` (hc_mult) | 4 | 残差流数 |
++| `mhc_tau` | 0.05 | Sinkhorn 温度 |
++| `hc_eps` | 1e-6 | 数值稳定 epsilon |
++| `mhc_sinkhorn_iterations` | 20 | Sinkhorn 迭代次数 |
++| `mhc_post_mult_value` | 2.0 | post 混合缩放 |
++| `mhc_no_norm_weight` | False | 使用 norm 权重 |
++
++### 4.3 mHC forward 流程（`model.py:386-488`）
++
++```python
++# 非 mHC 路径（MTP 层或 70B 模型）
++if not self.mhc or self.is_mtp_layer:
++    residual = hidden_states
++    hidden_states = self.input_layernorm(hidden_states)
++    attn_output = self.self_attn(hidden_states, positions)
++    hidden_states, residual = self.post_attention_layernorm(attn_output, residual)
++    hidden_states = self.mlp(hidden_states)
++    return hidden_states, residual, None, None
++
++# mHC 路径（标准 decoder layer）
++x = hidden_states
++if post is None:  # Layer 0
++    x = hc_expand(x, self.n)        # [N, H] → [N, 4H]
++    residual = x
++    post, comb, x = self.hc_pre(x, ...)  # Sinkhorn + norm
++else:  # Layer 1+
++    residual, post, comb, x = self.hc_post_pre(x, residual, post, comb, ...)
++
++x = self.self_attn(x, positions)   # attention on expanded state
++residual, post, comb, x = self.hc_post_pre(x, ...)  # post-attn + pre-ffn
++x = self.mlp(x)                    # FFN on expanded state
++
++if last_layer:
++    x = self.hc_post(x, ...)       # finalize deferred post
++    x = hc_contract(x, self.n)     # [N, 4H] → [N, H]
++    return x, None, None, None
++
++return x, residual, post, comb     # defer post to next layer
++```
++
++**关键设计**：每层的 `hc_post` 被延迟到下一层的 `hc_pre` 中执行（`hc_post_pre`），避免额外的 kernel launch。只有最后一层才真正执行 `hc_post` + `hc_contract`。
++
++### 4.4 mHC 参数结构
++
++每个 mHC 层有 4 组参数（`model.py:376-384`）：
++
++```
++hc_attn_fn:    [mix_hc, d_model] = [(2+4)*4, 4*4096] = [24, 16384]  # attention 混合
++hc_attn_base:  [24]
++hc_attn_scale: [3]
++
++hc_ffn_fn:     [24, 16384]   # FFN 混合
++hc_ffn_base:   [24]
++hc_ffn_scale:  [3]
++```
++
++其中 `mix_hc = (2 + n) * n = (2+4)*4 = 24`，`d_model = n * hidden_size = 4 * 4096 = 16384`。
++
++---
++
++## 五、投机解码（MTP）结构
++
++源码：`vllm_ascend/models/glm5next/mtp.py:39-410`
++
++### 5.1 MTP 层结构
++
++```mermaid
++graph TB
++    subgraph "Glm5NextMTP (top-level)"
++        subgraph "Glm5NextMultiTokenPredictor"
++            EMB_MTP["embed_tokens<br/>(shared with target)"]
++            
++            subgraph "MTP Layer 0 (num_mtp_layers=1)"
++                FEN["fused_eh_norm<br/>positions zero + enorm + hnorm + cat"]
++                EH["eh_proj<br/>2×4096 → 4096"]
++                BLOCK["mtp_block<br/>Glm5NextDecoderLayer<br/>(MLA + MoE, is_mtp_layer=True)"]
++                SH["shared_head<br/>norm + LMHead<br/>(shared with target)"]
++            end
++        end
++        
++        LOGITS["logits_processor"]
++    end
++    
++    IDS["input_ids"] --> EMB_MTP
++    EMB_MTP -->|"inputs_embeds"| FEN
++    THS["target_hidden_states"] -->|"previous_hidden"| FEN
++    FEN --> EH
++    EH --> BLOCK
++    BLOCK --> SH
++    SH --> LOGITS
++    LOGITS -->|"argmax"| DRAFT["draft_token"]
++```
++
++### 5.2 MTP forward 流程（`mtp.py:80-104`）
++
++```python
++def forward(self, input_ids, positions, previous_hidden_states, inputs_embeds, spec_step_idx):
++    # 融合：位置0清零 + enorm(embed) + hnorm(prev) + cat → [N, 2H]
++    eh_input = fused_eh_norm(
++        positions, inputs_embeds, previous_hidden_states,
++        self.enorm.weight, self.hnorm.weight, self.enorm.variance_epsilon)
++    
++    # 投影 [2H] → [H]
++    hidden_states = self.eh_proj(eh_input)
++    
++    # Decoder block: MLA attention + MoE MLP
++    hidden_states, residual, _, _ = self.mtp_block(
++        positions=positions, hidden_states=hidden_states, residual=None)
++    
++    # Fused residual add + RMSNorm
++    hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
++    return hidden_states, hidden_states  # (output, recycled for next step)
++```
++
++### 5.3 MTP 层选择机制（`mtp.py:153-170`）
++
++```python
++class Glm5NextMultiTokenPredictor(nn.Module):
++    def forward(self, input_ids, positions, previous_hidden_states, inputs_embeds, spec_step_idx):
++        current_step_idx = spec_step_idx % self.num_mtp_layers  # ★ 取模选层
++        return self._mtp_layers[current_step_idx](
++            input_ids, positions, previous_hidden_states, inputs_embeds, current_step_idx)
++```
++
++当 `num_nextn_predict_layers=1` 时（默认），所有 draft step 复用同一个 MTP 层。
++
++### 5.4 Index Cache 跨步复用优化（`mtp.py:137-148`）
++
++```python
++def set_skip_topk(self, skip: bool):
++    # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
++    for mla_attn in self._mtp_mla_attns:
++        mla_attn.skip_topk = skip
++
++def compact_topk_indices(self, slot_ids: torch.Tensor):
++    """Gather the top-k index rows at slot_ids to the front of the buffer."""
++    num_slots = slot_ids.numel()
++    for mla_attn in self._mtp_mla_attns:
++        topk_indices_buffer = mla_attn.topk_indices_buffer
++        topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
++```
++
++- **Step 0**：MTP 层的 MLA attention 计算 sparse top-k index
++- **Step 1+**：跳过 top-k 计算（`skip_topk=True`），直接复用 step 0 的 index
++- 配置项：`index_share_for_mtp_iteration = true`
++
++### 5.5 MTP 与 target 的对接
++
++```mermaid
++sequenceDiagram
++    participant T as Target Model (45 layers)
++    participant R as Model Runner
++    participant M as MTP Drafter
++    
++    T->>T: forward(input_ids, positions)
++    T->>T: 45 层 decoder (KDA + MLA + MoE + mHC)
++    T->>T: norm → hidden_states [N, 4096]
++    T->>R: return hidden_states
++    
++    R->>R: sampler(target_hidden) → bonus_token
++    R->>R: get_mtp_target_hidden_states()
++    R->>M: _propose(target_token_ids, target_positions, target_hidden_states, K=3)
++    
++    M->>M: Step 0 (spec_step_idx=0): embed + hnorm(target_hidden) → mtp_block → shared_head → draft_token[0]
++    M->>M: Step 1 (spec_step_idx=1): embed(draft[0]) + hnorm(hidden⁰) → mtp_block → shared_head → draft_token[1]
++    M->>M: Step 2 (spec_step_idx=2): embed(draft[1]) + hnorm(hidden¹) → mtp_block → shared_head → draft_token[2]
++    M->>R: return [draft_0, draft_1, draft_2]
++    
++    R->>T: verify([bonus, draft_0, draft_1, draft_2])
++    T->>T: 一次前向验证 4 个 token
++    T->>R: rejection sampling → accepted tokens
++```
++
++---
++
++## 六、完整 Decoder Layer 结构图（mHC + KDA + MoE）
++
++以下是标准 mHC decoder layer 的完整数据流（非 MTP 层）：
++
++```mermaid
++graph TB
++    subgraph "Glm5NextDecoderLayer (mHC enabled)"
++        IN["hidden_states [N, 4096]<br/>+ post, comb, residual (from prev layer)"]
++        
++        subgraph "hc_pre (attention)"
++            HCPRE1["npu_hc_pre_v2<br/>Sinkhorn 20 iters<br/>post_mix + res_mix"]
++            NORM1["RMSNorm(input_layernorm)"]
++            HCPRE1 --> NORM1
++        end
++        
++        subgraph "Attention"
++            ATTN_DISP{"layer_types[i]?"}
++            ATTN_DISP -->|"linear_attention"| KDA["Glm5NextLinearAttention<br/>conv1d + recurrent/chunk<br/>O(N) complexity"]
++            ATTN_DISP -->|"deepseek_sparse_attention"| MLA["Glm5NextMLAAttention<br/>MLA + Indexer top-k<br/>O(N×topk) complexity"]
++        end
++        
++        subgraph "hc_post_pre (ffn)"
++            HCPOST1["npu_hc_post<br/>(deferred from pre)"]
++            HCPRE2["npu_hc_pre_v2<br/>(new pre for ffn)"]
++            NORM2["RMSNorm(post_attention_layernorm)"]
++            HCPOST1 --> HCPRE2 --> NORM2
++        end
++        
++        subgraph "FFN"
++            FFN_DISP{"mlp_layer_types[i]?"}
++            FFN_DISP -->|"dense"| MLP["Glm5NextMLP<br/>SwiGLU<br/>intermediate=12288"]
++            FFN_DISP -->|"sparse"| MOE["Glm5NextMoE<br/>288 experts, top-8<br/>+ 1 shared expert"]
++        end
++        
++        OUT["hidden_states [N, 4×4096]<br/>+ post, comb, residual (to next layer)"]
++        
++        IN --> HCPRE1
++        NORM1 --> ATTN_DISP
++        KDA --> HCPOST1
++        MLA --> HCPOST1
++        NORM2 --> FFN_DISP
++        MLP --> OUT
++        MOE --> OUT
++    end
++```
++
++---
++
++## 七、模型注册与加载
++
++### 7.1 模型注册（`models/__init__.py:89-98`）
++
++```python
++ModelRegistry.register_model("Glm5NextForCausalLM", "vllm_ascend.models.glm5next.model:Glm5NextForCausalLM")
++ModelRegistry.register_model("Glm5NextForConditionalGeneration", "...")
++ModelRegistry.register_model("Glm5NextMTPModel", "vllm_ascend.models.glm5next.mtp:Glm5NextMTP")
++```
++
++### 7.2 架构层级
++
++```mermaid
++graph TB
++    CG["Glm5NextForConditionalGeneration<br/>(multimodal: vision + text)"]
++    LM["Glm5NextForCausalLM<br/>(text-only, HasInnerState, IsHybrid, MoE, SupportsPP)"]
++    MODEL["Glm5NextModel<br/>(45 decoder layers)"]
++    DL["Glm5NextDecoderLayer<br/>(mHC + KDA/MLA + Dense/MoE)"]
++    
++    MTP["Glm5NextMTP<br/>(speculative decoding)"]
++    MTPL["Glm5NextMultiTokenPredictorLayer<br/>(eh_proj + decoder + shared_head)"]
++    
++    CG -->|"language_model"| LM
++    LM -->|"model"| MODEL
++    MODEL -->|"layers[i]"| DL
++    CG -.->|"speculative"| MTP
++    MTP -->|"model.layers[i]"| MTPL
++```
++
++### 7.3 接口声明
++
++`Glm5NextForCausalLM` 实现了以下接口（`model.py:839`）：
++- `HasInnerState`：有内部状态（KDA 的 conv/recurrent state）
++- `SupportsPP`：支持流水线并行
++- `MixtureOfExperts`：MoE 模型
++- `IsHybrid`：混合架构（KDA + MLA）
++
++---
++
++## 八、关键设计总结
++
++```mermaid
++graph MindMap
++    root((GLM-5.2<br/>Glm5Next))
++    Attention
++        KDA_Linear<br/>78% layers
++        conv1d kernel=4
++        recurrent state
++        O_N complexity
++        bounded sigmoid gate
++        chunk + recurrent
++        MLA_Sparse<br/>22% layers
++        MLA low-rank KV
++        kv_lora=512
++        Indexer top-k=2048
++        kpool 4_1 compression
++        O_N×topk complexity
++    FFN
++        Dense_MLP<br/>first 3 layers
++        SwiGLU limit=10
++        intermediate=12288
++        MoE<br/>remaining layers
++        288 experts top-8
++        1 shared expert
++        sigmoid scoring
++        sequence parallel
++    Residual
++        mHC 4 streams
++        Sinkhorn 20 iters
++        hc_pre _ hc_post
++        deferred post fusion
++        expand _ contract
++    Spec_Decode
++        MTP 1 layer
++        shared embed _ head
++        fused_eh_norm
++        index cache reuse
++        spec_step_idx mod L
++    Hybrid
++        IsHybrid interface
++        KDA mamba state
++        MLA KV cache
++        auto block alignment
++```
++
++### 核心设计理念
++
++1. **混合注意力**：78% 的层用 KDA 线性注意力（O(N)，低延迟），22% 的层用 MLA 稀疏注意力（高精度，O(N×topk)），兼顾效率与精度。KDA 层无 KV cache，使用 mamba 式递归状态；MLA 层有 KV cache 但用 kpool 4:1 压缩 + top-2048 稀疏选择。
++
++2. **mHC 多残差流**：4 条并行残差流 + Sinkhorn 归一化，替代标准残差连接。每层的 hc_post 延迟到下一层 hc_pre 执行，减少 kernel launch。expand 在 layer 0，contract 在最后一层。
++
++3. **MoE 大规模稀疏**：288 专家选 8，1 个共享专家始终激活。Sigmoid 路由 + noaux_tc 修正 + sequence parallel 支持。
++
++4. **MTP 投机解码**：1 层 MTP（默认），复用 target 的 embedding 和 LM head。Index cache 跨 draft step 复用（`index_share_for_mtp_iteration`），省去 step 1+ 的 top-k 计算。`fused_eh_norm` 融合位置清零 + 双 norm + cat 为单个 kernel。
++
++5. **PP 兼容**：mHC 的 `post` / `comb` 状态通过 `IntermediateTensors` 跨 PP stage 传递（`model.py:654-661, 695-702`），确保多 stage 间的 mHC 状态连续性。
++
++---
++
++## 九、投机解码全方案分析
++
++GLM-5.2 支持两种投机解码路径（MTP 和 DSpark），它们是 vllm-ascend 支持的多种投机解码方案中的两种。本节全面分析所有方案，重点解释 DFlash 技术及其与 DSpark、MTP 的区别。
++
++### 9.1 投机解码方案总览
++
++从 `vllm_ascend/spec_decode/__init__.py:41-70` 和 `worker/v2/spec_decode/__init__.py:25-78` 的分发逻辑可见全部方法：
++
++| 方案 | method 字段 | Proposer (v1) | Speculator (v2) | 思想 |
++|---|---|---|---|---|
++| Ngram | `"ngram"` | `AscendNgramProposer` | — | 历史 n-gram 模式匹配 |
++| Ngram GPU | `"ngram_gpu"` | `AscendNgramProposerNPU` | — | NPU 加速 n-gram |
++| Suffix | `"suffix"` | `AscendSuffixDecodingProposer` | — | 后缀树模式匹配 |
++| Medusa | `"medusa"` | `AscendMedusaProposer` | — | 多头并行预测 |
++| Eagle/Eagle3 | `"eagle"`/`"eagle3"` | `AscendEagleProposer` | `AscendEagleSpeculator` | target hidden 引导小模型自回归 |
++| MTP | `"mtp"` | `AscendEagleProposer` | `AscendMTPSpeculator` | 同 checkpoint 追加层自回归 |
++| DFlash | `"dflash"` | `AscendDflashProposer` | `AscendDFlashSpeculator` | KV 预填 + 并行 query 块 |
++| DFlash2 | `"dflash"` (DFlash2DraftModel) | `AscendDflash2Proposer` | `AscendDFlash2Speculator` | DFlash + 树搜索选择器 |
++| DSpark | `"dspark"` | `AscendDSparkProposer` | `AscendDSparkSpeculator` | DFlash + Markov head + confidence |
++| Draft Model | `"draft_model"` | `AscendDraftModelProposer` | — | 独立小模型自回归 |
++| Extract HS | `"extract_hidden_states"` | `AscendExtractHiddenStatesProposer` | `ExtractHiddenStatesSpeculator` | target 自身 hidden 投影 |
++
++### 9.2 三大类的核心思想
++
++```mermaid
++graph TB
++    subgraph "A: 无模型 (模式匹配)"
++        NG["Ngram<br/>n-gram 历史匹配<br/>0 forward"]
++        SF["Suffix<br/>后缀树匹配<br/>0 forward"]
++    end
++    
++    subgraph "B: 自回归 (K 步串行)"
++        EG["Eagle / Eagle3<br/>target hidden → 小模型<br/>K 次 forward"]
++        MTP["MTP<br/>target 末层 → 追加层<br/>K 次 forward (共享 KV)"]
++        DM["Draft Model<br/>独立小模型<br/>K 次 forward"]
++    end
++    
++    subgraph "C: 块式 (1 次 forward)"
++        DF["DFlash<br/>KV 预填 + 并行 query<br/>1 次 forward + argmax"]
++        DF2["DFlash2<br/>DFlash + 树搜索<br/>1 次 forward + greedy walk"]
++        DS["DSpark<br/>DFlash + Markov 校正<br/>1 次 forward + K 次轻量 Markov"]
++    end
++    
++    subgraph "D: 无 draft forward"
++        MK["Medusa<br/>K 个 head 并行<br/>0 forward (复用 target hidden)"]
++        EHS["Extract HS<br/>target hidden → 投影 head<br/>0 forward"]
++    end
++```
++
++### 9.3 DFlash 技术详解
++
++#### 9.3.1 DFlash 是什么
++
++DFlash（Draft Flash）是一种**块式投机解码**方案。核心思想是：用 target 模型的辅助 hidden states 预填充 draft 模型的 KV cache，然后构造一个包含 `1 + K` 个 query 位置的查询块，**一次 forward 并行产出全部 K 个 draft token 的 hidden states**，最后用 argmax 选出 draft token。
++
++源码继承关系（`dflash_proposer.py:40`）：
++```python
++class AscendDflashProposer(AscendEagleProposer):  # DFlash 继承 Eagle
++```
++
++DSpark 进一步继承 DFlash（`dspark_proposer.py:23`）：
++```python
++class AscendDSparkProposer(AscendDflashProposer):  # DSpark 继承 DFlash
++```
++
++#### 9.3.2 DFlash 的计算过程
++
++```mermaid
++sequenceDiagram
++    participant T as Target Model
++    participant P as DFlash Proposer
++    participant D as Draft Model
++    
++    T->>T: forward(input_ids, positions)
++    T->>T: 收集 aux_hidden_states [N, aux_H]
++    T->>P: return hidden_states
++    
++    P->>P: set_inputs_first_pass()
++    Note over P: 构造 query 块: batch × (1+K) 个位置<br/>位置 = pos+1, pos+2, ..., pos+1+K<br/>causal=False (非因果注意力)
++    
++    P->>D: build_model_inputs_first_pass()
++    D->>D: precompute_and_store_context_kv()<br/>target hidden → draft KV cache 预填充
++    Note over D: draft KV 已包含全部上下文
++    
++    P->>D: model.forward(input_ids=[batch×(1+K)])
++    Note over D: 1 次 forward<br/>K+1 个 query 并行<br/>每个 query 读预填 KV
++    D->>P: return hidden_states [batch×(1+K), H]
++    
++    P->>P: compute_logits(hidden) → [batch, K, V]
++    P->>P: argmax(logits) → draft_token_ids [batch, K]
++    Note over P: 简单 argmax，无 Markov 校正
++    P->>T: return draft_token_ids
++```
++
++**关键代码**（`dflash_proposer.py:100-187`）：
++
++```python
++def set_inputs_first_pass(self, ...):
++    batch_size = cad.num_reqs
++    num_query_per_req = 1 + self.num_speculative_tokens  # ★ 1 anchor + K spec
++    num_query_total = batch_size * num_query_per_req
++    
++    # Triton kernel 构造全部 query 位置的 input_ids/positions/slot_mapping
++    copy_and_expand_dflash_and_dspark_inputs_kernel[grid](
++        next_token_ids_ptr=next_token_ids,       # anchor token
++        out_input_ids_ptr=self.input_ids,         # [batch×(1+K)] 个 input_ids
++        out_query_positions_ptr=self.positions,   # [batch×(1+K)] 个位置
++        ...
++        SAMPLE_FROM_ANCHOR=False,                 # ★ DFlash 总是包含 anchor
++    )
++    
++    cad.seq_lens = effective_seq_lens + num_query_per_req
++    cad.causal = False                            # ★ 非因果注意力
++    cad.attn_state = AscendAttentionState.ChunkedPrefill
++```
++
++**KV 预填充**（`dflash_proposer.py:301-319`）：
++
++```python
++def build_model_inputs_first_pass(self, num_input_tokens, _context_slots):
++    num_context = self._dflash_num_context
++    self.model.precompute_and_store_context_kv(
++        self._dflash_hidden_states[:num_context],       # target 的 aux hidden
++        self._context_positions_buffer[:num_context],    # 上下文位置
++        _context_slots,                                   # KV cache slot
++    )
++```
++
++**Token 选择**（`llm_base_proposer.py:1615-1625`）：
++
++```python
++# DFlash 走 else 分支（不是 dspark）
++logits = self.model.compute_logits(sample_hidden_states)  # [batch×K, V]
++draft_token_ids, draft_probs_step0 = self._sample_draft_from_logits(logits, sampling_metadata)
++# ★ 简单 argmax 或 probabilistic 采样，无 Markov 校正
++```
++
++#### 9.3.3 DFlash2：树搜索增强
++
++DFlash2 是 DFlash 的增强版，用**树搜索选择器**替代简单 argmax：
++
++```python
++# dflash2_proposer.py:82-107
++def compute_draft_token_ids(self, hidden_states, sampling_metadata):
++    num_reqs = num_sample // num_steps
++    hidden = hidden_states.view(num_reqs, num_steps, -1)
++    
++    # 每步产出 top-k 个候选 token（而非只 1 个）
++    candidate_ids, unary_logits = self.model.compute_candidates(hidden.flatten(0, 1))
++    # candidate_ids: [num_reqs, num_steps, top_k]
++    
++    # 候选间转移评分矩阵 [num_reqs, num_steps, top_k, top_k]
++    scores = self.model.model.candidate_selector(
++        candidate_ids, unary_logits, hidden, anchor_token_ids)
++    
++    # 贪心走树，选最优路径
++    return greedy_select_path(candidate_ids, scores).reshape(-1), None
++```
++
++DFlash2 的 Triton 树搜索 kernel（`dflash2_proposer.py:37-44`）：
++
++```python
++dflash2_greedy_selector_walk_kernel[(num_programs,)](
++    scores,           # [num_reqs, num_steps, top_k, top_k]
++    candidate_ids,    # [num_reqs, num_steps, top_k]
++    output_tokens,    # [num_reqs, num_steps]
++    num_reqs, num_steps=num_steps, top_k=top_k,
++)
++```
++
++### 9.4 DFlash vs DSpark vs MTP 对比
++
++#### 9.4.1 核心机制对比
++
++```mermaid
++graph LR
++    subgraph "MTP: K 步自回归"
++        M0["target hidden<br/>[batch×1]"]
++        M1["draft forward 0<br/>(attn + mlp)<br/>→ token[0]"]
++        M2["draft forward 1<br/>(attn + mlp)<br/>→ token[1]"]
++        M3["draft forward 2<br/>(attn + mlp)<br/>→ token[2]"]
++        M0 --> M1 --> M2 --> M3
++        note_m["K 次完整 forward<br/>每次 batch×1 token<br/>causal=True"]
++    end
++    
++    subgraph "DFlash: 1 次 forward + argmax"
++        D0["target aux hidden<br/>[N, aux_H]"]
++        D1["KV 预填充"]
++        D2["1 次 forward<br/>batch×(1+K) tokens<br/>并行"]
++        D3["argmax<br/>→ K tokens"]
++        D0 --> D1 --> D2 --> D3
++        note_d["1 次 forward<br/>causal=False<br/>简单 argmax"]
++    end
++    
++    subgraph "DSpark: 1 次 forward + Markov 校正"
++        S0["target aux hidden<br/>[N, aux_H]"]
++        S1["KV 预填充"]
++        S2["1 次 forward<br/>batch×K tokens<br/>并行"]
++        S3["logits [batch, K, V]"]
++        S4["Markov bias<br/>(K 次轻量)"]
++        S5["argmax + bias<br/>→ K tokens"]
++        S0 --> S1 --> S2 --> S3 --> S4 --> S5
++        note_s["1 次 forward + K 次轻量校正<br/>causal=False<br/>Markov + confidence + 缩减词表"]
++    end
++```
++
++#### 9.4.2 逐项对比表
++
++| 维度 | MTP | DFlash | DSpark |
++|---|---|---|---|
++| **Draft 模型来源** | 同一 checkpoint 追加层 | 独立 checkpoint | 独立 checkpoint |
++| **Hidden state 来源** | target 末层（单层） | target 多层 aux | target 多层 aux |
++| **KV cache** | 共享 target | 独立（预填充） | 独立（预填充） |
++| **Embedding/LM head** | 共享 target | 独立或共享 | 独立或缩减词表 |
++| **Forward 次数** | K 次（串行自回归） | 1 次（并行块） | 1 次（并行块） |
++| **每次 forward 规模** | batch×1 token | batch×(1+K) tokens | batch×K tokens |
++| **注意力类型** | causal（因果） | non-causal（非因果） | non-causal（非因果） |
++| **Token 选择** | shared_head → argmax | argmax（简单） | Markov bias + argmax（K 次校正） |
++| **query 块构成** | 无（逐步） | 1 anchor + K spec | K spec（sample_from_anchor） |
++| **额外组件** | 无 | 无 | Markov head + confidence head + draft_id_to_target_id |
++| **自适应验证** | 不支持 | DynamicSpecScheduler（logits） | DynamicSpecScheduler（confidence head） |
++| **ACLGraph** | 支持 FULL | 支持 FULL | eager only |
++| **典型 K** | 1~3 | 4~8 | 7+ |
++| **Proboser 继承** | EagleProposer | EagleProposer → DflashProposer | DflashProposer → DSparkProposer |
++| **配置示例** | `method="mtp"` | `method="dflash", model="z-lab/...-DFlash"` | `method="dspark", model="...-dspark"` |
++
++#### 9.4.3 DFlash → DSpark 的增量演进
++
++DSpark 继承 DFlash（`dspark_proposer.py:23`），在 DFlash 基础上增加了四个组件：
++
++| DSpark 增量 | 代码位置 | 作用 |
++|---|---|---|
++| **Markov head** | `glm5_dspark.py:107-113` | K 次轻量 logit bias 校正，补偿并行 forward 的误差 |
++| **Confidence head** | `glm5_dspark.py:114-122` | 预测每 token 的期望接受长度，驱动自适应验证 |
++| **缩减词表** | `glm5_dspark.py:212-216` | `draft_id_to_target_id` 映射，减少 lm_head 计算 |
++| **sample_from_anchor** | `dspark_proposer.py:39-43` | 去掉 anchor token，query 块只含 K 个 spec 位置 |
++
++Markov 校正的关键代码（`llm_base_proposer.py:1583-1599`）：
++
++```python
++for idx in range(self.num_speculative_tokens):      # K 次，但每次极轻量
++    markov_emb = self.model.markov_embed(draft_token_ids[:, idx])  # embedding 查表 O(H)
++    logits_bias = self.model.markov_bias(markov_emb)               # 1 个 linear O(H×V)
++    logits[:, idx].add_(logits_bias)                                # 校正
++    next_token_ids = logits[:, idx].argmax(dim=-1)                  # 采样
++    draft_token_ids[:, idx + 1].copy_(next_token_ids)
++```
++
++**关键区别**：这个循环的每步只做 **embedding 查表 + 1 个 linear**（O(H×V) FLOPs），**不做 attention 和 MLP**。而 MTP 的自回归循环每步做完整的 **MLA attention + MLP**（O(N²×H + N×H²) FLOPs）。
++
++#### 9.4.4 DFlash 的设计哲学
++
++DFlash 的核心突破是**将自回归推到轻量部分**：
++
++```
++传统自回归 (MTP/Eagle):
++  [expensive: attn+mlp] → token → [expensive: attn+mlp] → token → ...
++  K 次昂贵操作，串行
++
++DFlash:
++  [KV 预填] → [expensive: 1 次 attn+mlp，K 个并行] → [cheap: K 次 argmax]
++  1 次昂贵操作 + K 次廉价操作
++
++DSpark:
++  [KV 预填] → [expensive: 1 次 attn+mlp，K 个并行] → [cheap: K 次 Markov embed+bias+argmax]
++  1 次昂贵操作 + K 次轻量校正（比纯 argmax 精度更高）
++```
++
++### 9.5 全部方案的 Draft 模型结构对比
++
++```mermaid
++graph TB
++    subgraph "Ngram/Suffix: 无模型"
++        N["历史 token 序列<br/>→ n-gram / 后缀树匹配<br/>→ 返回后续 token"]
++    end
++    
++    subgraph "Medusa: 多头并行"
++        MK_T["target hidden [N, H]"]
++        MK_H0["MLP head 0 → token[0]"]
++        MK_H1["MLP head 1 → token[1]"]
++        MK_HK["MLP head K → token[K]"]
++        MK_T --> MK_H0
++        MK_T --> MK_H1
++        MK_T --> MK_HK
++    end
++    
++    subgraph "Eagle/Eagle3: 自回归小模型"
++        EG_T["target hidden / aux hidden"]
++        EG_L["Draft Layer (小 transformer)<br/>embed + attn + mlp + head"]
++        EG_R["reuse same layer<br/>embed(token[0]) + attn + mlp"]
++        EG_T --> EG_L -->|"token[0]"| EG_R -->|"token[1]"| EG_DOTS["..."]
++    end
++    
++    subgraph "MTP: 同 checkpoint 追加层"
++        MTP_T["target 末层 hidden"]
++        MTP_L["MTP Layer<br/>eh_proj + decoder + shared_head"]
++        MTP_R["reuse same layer<br/>eh_proj + decoder + shared_head"]
++        MTP_T --> MTP_L -->|"token[0]"| MTP_R -->|"token[1]"| MTP_DOTS["..."]
++    end
++    
++    subgraph "DFlash: 块式 + argmax"
++        DF_T["target aux hidden [N, aux_H]"]
++        DF_KV["precompute KV<br/>context → draft KV cache"]
++        DF_F["1 次 forward<br/>batch×(1+K) query 并行"]
++        DF_A["argmax → K tokens"]
++        DF_T --> DF_KV --> DF_F --> DF_A
++    end
++    
++    subgraph "DSpark: 块式 + Markov 校正"
++        DS_T["target aux hidden [N, aux_H]"]
++        DS_KV["precompute KV"]
++        DS_F["1 次 forward<br/>batch×K query 并行"]
++        DS_L["logits [batch, K, V]"]
++        DS_M["Markov bias × K<br/>(轻量: embed + linear)"]
++        DS_A["argmax + bias → K tokens"]
++        DS_CF["confidence head<br/>(自适应验证)"]
++        DS_T --> DS_KV --> DS_F --> DS_L --> DS_M --> DS_A
++        DS_A -.-> DS_CF
++    end
++```
++
++### 9.6 配置示例对比
++
++#### MTP 配置（同一 checkpoint）
++
++```python
++VllmRunner(
++    "Eco-Tech/GLM-5.2-w4a8",
++    speculative_config={
++        "method": "mtp",
++        "num_speculative_tokens": 3,
++    },
++    # 无需指定 draft model — 同一 checkpoint
++)
++```
++
++#### DFlash 配置（独立 checkpoint）
++
++```python
++VllmRunner(
++    "Qwen/Qwen3-8B",
++    speculative_config={
++        "method": "dflash",
++        "model": "z-lab/Qwen3-8B-DFlash-b16",     # 独立 draft
++        "num_speculative_tokens": 8,               # K=8
++    },
++)
++```
++
++#### DFlash2 配置（树搜索）
++
++```python
++VllmRunner(
++    "Qwen/Qwen3.8-27B",
++    speculative_config={
++        "method": "dflash",
++        "model": "z-lab/Qwen3.8-27B-DFlash2",     # DFlash2DraftModel 架构
++        "num_speculative_tokens": 8,
++    },
++)
++```
++
++#### DSpark 配置（Markov + confidence）
++
++```python
++VllmRunner(
++    "Eco-Tech/GLM-5.2-w4a8",
++    speculative_config={
++        "method": "dspark",
++        "model": "RedHatAI/GLM-5.2-speculator.dspark",
++        "num_speculative_tokens": 7,               # K=7
++    },
++    quantization="ascend",
++    tensor_parallel_size=8,
++)
++```
++
++### 9.7 路径分发机制
++
++用户通过 `speculative_config.method` 字段控制走哪条路径。
++
++**V2 分发**（`worker/v2/spec_decode/__init__.py:25-78`）：
++
++```python
++def init_speculator(vllm_config, device):
++    spec = vllm_config.speculative_config
++    if spec.use_dspark():               # → DSpark
++        return AscendDSparkSpeculator(vllm_config, device)
++    if spec.use_dflash():               # → DFlash / DFlash2
++        if "DFlash2DraftModel" in spec.draft_model_config.architectures:
++            return AscendDFlash2Speculator(...)
++        return AscendDFlashSpeculator(...)
++    if spec.method == "mtp":            # → MTP
++        return AscendMTPSpeculator(vllm_config, device)
++    if spec.use_eagle():                # → Eagle
++        return AscendEagleSpeculator(vllm_config, device)
++```
++
++**V1 分发**（`spec_decode/__init__.py:41-70`）：
++
++```python
++def get_spec_decode_method(method, vllm_config, device, runner):
++    if method == "dspark":   → AscendDSparkProposer
++    elif method == "dflash": → AscendDflashProposer / AscendDflash2Proposer
++    elif method == "mtp":    → AscendEagleProposer (MTP 复用 Eagle 路径)
++    elif method == "eagle":  → AscendEagleProposer
++```
++
++**GLM-5.2 的 model_type 自动重映射**（`patch_speculative_config.py:99-107`）：
++
++当检测到 `model_type in ("glm5_next", "glm5_next_text")` 且使用 MTP 时：
++```python
++hf_config.model_type = "glm5_next_mtp"
++hf_config.update({"architectures": ["Glm5NextMTPModel"]})
++```
++
++DSpark 则通过 `_normalize_glm_mla_dspark`（`patch_speculative_config.py:212-230`）恢复 MLA 架构元数据。
++
++### 9.8 方案选择建议
++
++| 场景 | 推荐方案 | 理由 |
++|---|---|---|
++| 轻量加速，同 checkpoint，K≤3 | MTP | 无额外 checkpoint，部署简单，共享 KV |
++| 高 K (4~8)，通用模型 | DFlash | 1 次 forward，高 K 友好 |
++| 高 K + 高精度 + 自适应 | DSpark | Markov 校正提升精度，confidence 驱动动态调度 |
++| 代码/重复文本 | Ngram/Suffix | 零计算开销，模式匹配命中率高 |
++| 通用，多层 aux states | Eagle3 | 收集 target 多层信息，精度高 |
++| target 已训练辅助 head | Extract HS | 零 draft forward |
++
++**核心演进路线**：从"零计算模式匹配"（Ngram）→ "自回归 K 步"（Eagle/MTP）→ "一次 forward 块式提案"（DFlash）→ "块式 + 轻量校正"（DSpark），逐步将昂贵操作（attention+MLP）的次数从 K 压到 1，将自回归推到轻量部分（Markov embedding+bias），从而支持更高 K 和更高吞吐。
+diff --git a/vllm_ascend/activation_memory.py b/vllm_ascend/activation_memory.py
+new file mode 100644
+index 000000000..54ddf5a02
+--- /dev/null
++++ b/vllm_ascend/activation_memory.py
+@@ -0,0 +1,356 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Scoped activation-memory peak diagnostics for Ascend profile runs.
++
++Adapted from vllm-ascend v0.23 for v0.30 DSA-CP + SP-MoE execution path.
++Target: GLM-5.2 (glm_moe_dsa) 1M prefill peak memory profiling.
++
++Usage:
++  Set additional_config={"activation_peak_debug": true, "activation_peak_debug_rank": 0}
++  AND enforce_eager=true (graph capture is incompatible with NPU sync).
++
++The profiler uses nested context managers via ContextVar, so any code in the
++forward path can record a scoped peak without passing the profiler around:
++
++    with record_activation_peak("target_attn", "sfa_mla", layer_idx=idx):
++        # ... sparse MLA attention ...
++
++Each scope records:
++  - baseline_bytes: torch.npu.memory_allocated() before the scope
++  - peak_bytes: max(torch.npu.max_memory_allocated()) during the scope
++  - allocated_after_bytes: torch.npu.memory_allocated() after the scope
++  - peak_growth_bytes: peak - baseline (transient peak)
++  - retained_bytes: after - baseline (retained by this scope)
++
++Nested scopes propagate their peak to parent scopes.
++"""
++
++from __future__ import annotations
++
++import time
++from collections.abc import Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++
++import torch
++from vllm.logger import logger
++
++_MIB = 1024**2
++_GIB = 1024**3
++
++
++@dataclass(frozen=True)
++class ActivationPeakRecord:
++    category: str
++    label: str
++    layer_idx: int | None
++    num_tokens: int | None
++    baseline_bytes: int
++    peak_bytes: int
++    allocated_after_bytes: int
++    peak_growth_bytes: int
++    retained_bytes: int
++    elapsed_ms: float
++
++
++@dataclass(frozen=True)
++class ActivationBufferRecord:
++    category: str
++    label: str
++    size_bytes: int
++
++
++@dataclass
++class _ActiveScope:
++    category: str
++    label: str
++    layer_idx: int | None
++    num_tokens: int | None
++    baseline_bytes: int
++    started_at: float
++    peak_bytes: int = 0
++
++
++@dataclass
++class ActivationPeakProfiler:
++    """Collect nested peak measurements without losing the global profile peak."""
++
++    rank: int
++    records: list[ActivationPeakRecord] = field(default_factory=list)
++    buffers: list[ActivationBufferRecord] = field(default_factory=list)
++    overall_peak_bytes: int = 0
++    _scopes: list[_ActiveScope] = field(default_factory=list)
++
++    def _synchronize(self) -> None:
++        torch.npu.synchronize()
++
++    def _checkpoint(self) -> int:
++        self._synchronize()
++        peak_bytes = int(torch.npu.max_memory_allocated())
++        self.overall_peak_bytes = max(self.overall_peak_bytes, peak_bytes)
++        for scope in self._scopes:
++            scope.peak_bytes = max(scope.peak_bytes, peak_bytes)
++        return peak_bytes
++
++    @contextmanager
++    def record(
++        self,
++        category: str,
++        label: str,
++        *,
++        layer_idx: int | None = None,
++        num_tokens: int | None = None,
++    ) -> Iterator[None]:
++        # Preserve parent work performed before resetting the peak for this
++        # child. Nested scopes propagate their peak back to every parent.
++        self._checkpoint()
++        baseline_bytes = int(torch.npu.memory_allocated())
++        torch.npu.reset_peak_memory_stats()
++        scope = _ActiveScope(
++            category=category,
++            label=label,
++            layer_idx=layer_idx,
++            num_tokens=num_tokens,
++            baseline_bytes=baseline_bytes,
++            started_at=time.perf_counter(),
++            peak_bytes=baseline_bytes,
++        )
++        self._scopes.append(scope)
++        try:
++            yield
++        finally:
++            self._checkpoint()
++            allocated_after_bytes = int(torch.npu.memory_allocated())
++            self._scopes.pop()
++            peak_bytes = max(scope.peak_bytes, allocated_after_bytes)
++            if self._scopes:
++                self._scopes[-1].peak_bytes = max(self._scopes[-1].peak_bytes, peak_bytes)
++            record = ActivationPeakRecord(
++                category=category,
++                label=label,
++                layer_idx=layer_idx,
++                num_tokens=num_tokens,
++                baseline_bytes=baseline_bytes,
++                peak_bytes=peak_bytes,
++                allocated_after_bytes=allocated_after_bytes,
++                peak_growth_bytes=max(0, peak_bytes - baseline_bytes),
++                retained_bytes=allocated_after_bytes - baseline_bytes,
++                elapsed_ms=(time.perf_counter() - scope.started_at) * 1000,
++            )
++            self.records.append(record)
++
++    def record_buffer(self, category: str, label: str, size_bytes: int) -> None:
++        record = ActivationBufferRecord(
++            category=category,
++            label=label,
++            size_bytes=size_bytes,
++        )
++        self.buffers.append(record)
++        logger.warning(
++            "[ACTIVATION_PEAK][BUFFER] rank=%s category=%s label=%s persistent=%.3f MiB (%.3f GiB)",
++            self.rank,
++            category.upper(),
++            label,
++            size_bytes / _MIB,
++            size_bytes / _GIB,
++        )
++
++    def log_summary(self) -> None:
++        if not self.records and not self.buffers:
++            logger.warning("[ACTIVATION_PEAK][SUMMARY] rank=%s no measured stages", self.rank)
++            return
++
++        # Category winners: the record with the HIGHEST ABSOLUTE PEAK per
++        # category (not growth — the goal is to find which stage sets the
++        # memory ceiling).
++        category_winners: dict[str, ActivationPeakRecord] = {}
++        for record in self.records:
++            previous = category_winners.get(record.category)
++            if previous is None or record.peak_bytes > previous.peak_bytes:
++                category_winners[record.category] = record
++
++        buffer_winners: dict[str, ActivationBufferRecord] = {}
++        for record in self.buffers:
++            previous = buffer_winners.get(record.category)
++            if previous is None or record.size_bytes > previous.size_bytes:
++                buffer_winners[record.category] = record
++
++        # Top-10 records by ABSOLUTE PEAK (the bottleneck stages to optimize).
++        top_peak = sorted(self.records, key=lambda r: r.peak_bytes, reverse=True)[:10]
++
++        # Absolute peak across all records.
++        absolute_peak_record = max(self.records, key=lambda r: r.peak_bytes)
++
++        sep = "=" * 80
++        logger.warning("[ACTIVATION_PEAK] %s", sep)
++        logger.warning("[ACTIVATION_PEAK] rank=%s  ACTIVATION MEMORY PEAK REPORT", self.rank)
++        logger.warning("[ACTIVATION_PEAK] %s", sep)
++
++        # Section A: Absolute peak
++        logger.warning(
++            "[ACTIVATION_PEAK][ABSOLUTE_PEAK] rank=%s category=%s label=%s "
++            "layer=%s tokens=%s baseline=%.3f GiB peak=%.3f GiB "
++            "growth=%.3f MiB retained=%+.3f MiB",
++            self.rank,
++            absolute_peak_record.category.upper(),
++            absolute_peak_record.label,
++            "-" if absolute_peak_record.layer_idx is None else absolute_peak_record.layer_idx,
++            "-" if absolute_peak_record.num_tokens is None else absolute_peak_record.num_tokens,
++            absolute_peak_record.baseline_bytes / _GIB,
++            absolute_peak_record.peak_bytes / _GIB,
++            absolute_peak_record.peak_growth_bytes / _MIB,
++            absolute_peak_record.retained_bytes / _MIB,
++        )
++
++        # Section B: Per-category summary (sorted by absolute peak)
++        for category, record in sorted(
++            category_winners.items(),
++            key=lambda item: item[1].peak_bytes,
++            reverse=True,
++        ):
++            logger.warning(
++                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s abs_peak=%.3f GiB "
++                "growth=%.3f MiB label=%s layer=%s tokens=%s",
++                self.rank,
++                category.upper(),
++                record.peak_bytes / _GIB,
++                record.peak_growth_bytes / _MIB,
++                record.label,
++                "-" if record.layer_idx is None else record.layer_idx,
++                "-" if record.num_tokens is None else record.num_tokens,
++            )
++
++        for category, record in sorted(buffer_winners.items()):
++            logger.warning(
++                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s persistent=%.3f MiB (%.3f GiB) label=%s",
++                self.rank,
++                category.upper(),
++                record.size_bytes / _MIB,
++                record.size_bytes / _GIB,
++                record.label,
++            )
++
++        # Section C: Top-10 by absolute peak
++        logger.warning("[ACTIVATION_PEAK][TOP10_PEAK] rank=%s (optimize these to lower the ceiling)", self.rank)
++        for i, r in enumerate(top_peak):
++            logger.warning(
++                "[ACTIVATION_PEAK]   #%2d  %-22s %-34s layer=%-4s  "
++                "abs_peak=%.3f GiB  growth=%.3f MiB",
++                i + 1,
++                r.category.upper(),
++                r.label,
++                "-" if r.layer_idx is None else r.layer_idx,
++                r.peak_bytes / _GIB,
++                r.peak_growth_bytes / _MIB,
++            )
++
++        # Section D: Verdict
++        top_level = [
++            record
++            for category in ("target_model",)
++            if (record := category_winners.get(category)) is not None
++        ]
++        components = [
++            record for category, record in category_winners.items() if category not in {"target_model"}
++        ]
++        dominant_top = max(top_level, key=lambda item: item.peak_bytes, default=None)
++        dominant_activation = max(components, key=lambda item: item.peak_bytes, default=None)
++        dominant_buffer = max(buffer_winners.values(), key=lambda item: item.size_bytes, default=None)
++        if dominant_buffer is not None and (
++            dominant_activation is None or dominant_buffer.size_bytes > dominant_activation.peak_bytes
++        ):
++            dominant_component_category = dominant_buffer.category.upper()
++            dominant_component_kind = "PERSISTENT_BUFFER"
++            dominant_component_bytes = dominant_buffer.size_bytes
++        elif dominant_activation is not None:
++            dominant_component_category = dominant_activation.category.upper()
++            dominant_component_kind = "ABSOLUTE_PEAK"
++            dominant_component_bytes = dominant_activation.peak_bytes
++        else:
++            dominant_component_category = "UNKNOWN"
++            dominant_component_kind = "UNKNOWN"
++            dominant_component_bytes = 0
++        logger.warning("[ACTIVATION_PEAK] %s", sep)
++        logger.warning(
++            "[ACTIVATION_PEAK][VERDICT] rank=%s dominant_top_level=%s "
++            "top_level_peak=%s dominant_component=%s component_kind=%s "
++            "component_bytes=%.3f MiB profile_absolute_peak=%.3f GiB "
++            "at_category=%s at_label=%s at_layer=%s",
++            self.rank,
++            dominant_top.category.upper() if dominant_top else "UNKNOWN",
++            f"{dominant_top.peak_bytes / _GIB:.3f} GiB" if dominant_top else "unknown",
++            dominant_component_category,
++            dominant_component_kind,
++            dominant_component_bytes / _MIB,
++            self.overall_peak_bytes / _GIB,
++            absolute_peak_record.category.upper(),
++            absolute_peak_record.label,
++            "-" if absolute_peak_record.layer_idx is None else absolute_peak_record.layer_idx,
++        )
++        logger.warning("[ACTIVATION_PEAK] %s", sep)
++
++
++_ACTIVE_PROFILER: ContextVar[ActivationPeakProfiler | None] = ContextVar(
++    "ascend_activation_peak_profiler",
++    default=None,
++)
++
++
++def is_activation_peak_profiling() -> bool:
++    return _ACTIVE_PROFILER.get() is not None
++
++
++@contextmanager
++def activation_peak_profile_session(
++    *,
++    enabled: bool,
++    rank: int,
++) -> Iterator[ActivationPeakProfiler | None]:
++    if not enabled:
++        yield None
++        return
++
++    profiler = ActivationPeakProfiler(rank=rank)
++    profiler._synchronize()
++    profiler.overall_peak_bytes = int(torch.npu.max_memory_allocated())
++    torch.npu.reset_peak_memory_stats()
++    token = _ACTIVE_PROFILER.set(profiler)
++    logger.warning(
++        "[ACTIVATION_PEAK] rank=%s profiling enabled; NPU synchronization is active and intended only for debugging.",
++        rank,
++    )
++    try:
++        yield profiler
++    finally:
++        profiler._checkpoint()
++        _ACTIVE_PROFILER.reset(token)
++        profiler.log_summary()
++
++
++@contextmanager
++def record_activation_peak(
++    category: str,
++    label: str,
++    *,
++    layer_idx: int | None = None,
++    num_tokens: int | None = None,
++) -> Iterator[None]:
++    profiler = _ACTIVE_PROFILER.get()
++    if profiler is None:
++        yield
++        return
++    with profiler.record(
++        category,
++        label,
++        layer_idx=layer_idx,
++        num_tokens=num_tokens,
++    ):
++        yield
++
++
++def record_activation_buffer(category: str, label: str, size_bytes: int) -> None:
++    profiler = _ACTIVE_PROFILER.get()
++    if profiler is not None:
++        profiler.record_buffer(category, label, size_bytes)
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index c49b4f8ca..772731f07 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -648,6 +648,10 @@ class AscendConfig:
+     pd_head_ratio: int = 1
+     num_head_replica: int = 1
+ 
++    # ---- activation peak profiling (debug only, requires enforce_eager) ----
++    activation_peak_debug: bool = False
++    activation_peak_debug_rank: int = 0
++
+     # ---- private derived state (init=False) ----
+     _sparse_li_c8_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
+     _sparse_li_c8_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
+@@ -660,6 +664,21 @@ class AscendConfig:
+     def _validate_user_input_ranges(self):
+         if self.weight_nz_mode not in (0, 1, 2):
+             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
++        if not isinstance(self.activation_peak_debug, bool):
++            raise ValueError(
++                f"activation_peak_debug must be a boolean, got "
++                f"{type(self.activation_peak_debug).__name__}: {self.activation_peak_debug}"
++            )
++        if isinstance(self.activation_peak_debug_rank, bool) or not isinstance(self.activation_peak_debug_rank, int):
++            raise ValueError(
++                f"activation_peak_debug_rank must be an integer, got "
++                f"{type(self.activation_peak_debug_rank).__name__}: {self.activation_peak_debug_rank}"
++            )
++        if self.activation_peak_debug_rank < -1:
++            raise ValueError(
++                f"activation_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
++                f"{self.activation_peak_debug_rank}"
++            )
+         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
+         if self.enable_mc2_hierarchy_comm:
+             self.mc2_comm_alg = "hierarchy"
+@@ -714,6 +733,12 @@ class AscendConfig:
+             )
+         self._check_mooncake_c8_kv_cache_quant(vc)
+ 
++        if self.activation_peak_debug and not getattr(vc.model_config, "enforce_eager", False):
++            raise ValueError(
++                "activation_peak_debug requires eager mode; set enforce_eager=true "
++                "because NPU synchronize is incompatible with ACLGraph capture."
++            )
++
+         # profiling_chunk vs min_chunk clamp
+         if self.scheduler_config.profiling_chunk_config.enabled:
+             max_batched = vc.scheduler_config.max_num_batched_tokens
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index c888d25e8..67126f085 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -24,6 +24,7 @@ from vllm.v1.worker.utils import select_common_block_size
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.activation_memory import record_activation_peak
+ from vllm_ascend.attention.context_parallel.common_cp import (
+     get_pcp_num_replicated_tokens,
+     is_pcp_decode_sharding_enabled,
+@@ -169,25 +170,17 @@ def sparse_mla(query, cache, indices, metadata, scale):
+     """Attend to original latent KV, using the platform's NoPE operator."""
+     cache = _view_cache_as_operator_pages(cache, metadata.block_size)
+     if metadata.smla_metadata is not None:
+-        # The A5 DMA merges adjacent columns. Preserve the selected set while
+-        # sorting token positions and moving invalid padding to the end.
+         sentinel = torch.iinfo(torch.int32).max
+         sorted_indices = torch.where(indices >= 0, indices, sentinel).sort(dim=-1).values
+         sorted_indices = torch.where(sorted_indices == sentinel, -1, sorted_indices)
+         if metadata.smla_sinks is None:
+             raise RuntimeError("Sparse MLA requires persistent sinks owned by SparseMLAMetadataState.")
+-        # MTP and shared indexers can reuse selections while positions advance.
+-        # Count the actual left-aligned prefix on every call, including target
+-        # FULL graphs whose query shape still matches the metadata capacity.
+         topk_length = metadata.smla_topk_length[: query.shape[0]]
+         metadata.smla_topk_length.zero_()
+-        # The builder refreshes this persistent mask outside graph capture.
+-        # A Python token count used here would freeze at the captured batch size.
+         valid = metadata.smla_valid_mask[: query.shape[0]]
+         topk_length.copy_((sorted_indices >= 0).sum(dim=-1, dtype=torch.int32).masked_fill(~valid, 0))
+         cu_seqlens_q = metadata.query_start_loc
+         if query.shape[0] != metadata.smla_topk_length.shape[0]:
+-            # Eager and piecewise execution trim graph-padding query rows.
+             cu_seqlens_q = cu_seqlens_q.clamp(max=query.shape[0])
+         build_smla_metadata(
+             metadata,
+@@ -198,47 +191,48 @@ def sparse_mla(query, cache, indices, metadata, scale):
+             cu_seqlens_q,
+             topk_length,
+         )
+-        result = sparse_flash_mla(
+-            query.contiguous(),
+-            ori_kv=cache,
+-            ori_sparse_indices=sorted_indices,
+-            ori_block_table=metadata.block_table,
+-            cu_seqlens_q=cu_seqlens_q,
+-            seqused_ori_kv=metadata.seq_lens,
+-            ori_topk_length=topk_length,
+-            sinks=metadata.smla_sinks,
+-            metadata=metadata.smla_metadata,
+-            softmax_scale=scale,
+-            cmp_ratio=1,
+-            # Must match the mode the plan above was generated with.
+-            ori_mask_mode=0,
+-            cmp_mask_mode=0,
+-            ori_win_left=-1,
+-            ori_win_right=-1,
+-            layout_q="TND",
+-            layout_kv="PA_BBND",
+-            topk_value_mode=1,
+-            return_softmax_lse=False,
+-        )
++        with record_activation_peak("target_attn_sfa", "sparse_flash_mla", num_tokens=query.shape[0]):
++            result = sparse_flash_mla(
++                query.contiguous(),
++                ori_kv=cache,
++                ori_sparse_indices=sorted_indices,
++                ori_block_table=metadata.block_table,
++                cu_seqlens_q=cu_seqlens_q,
++                seqused_ori_kv=metadata.seq_lens,
++                ori_topk_length=topk_length,
++                sinks=metadata.smla_sinks,
++                metadata=metadata.smla_metadata,
++                softmax_scale=scale,
++                cmp_ratio=1,
++                ori_mask_mode=0,
++                cmp_mask_mode=0,
++                ori_win_left=-1,
++                ori_win_right=-1,
++                layout_q="TND",
++                layout_kv="PA_BBND",
++                topk_value_mode=1,
++                return_softmax_lse=False,
++            )
+     else:
+-        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+-            query=query.contiguous(),
+-            key=cache,
+-            value=cache,
+-            sparse_indices=indices,
+-            scale_value=scale,
+-            sparse_block_size=1,
+-            block_table=metadata.block_table,
+-            actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
+-            actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
+-            query_rope=None,
+-            key_rope=None,
+-            layout_query="TND",
+-            layout_kv="PA_BSND",
+-            sparse_mode=3,
+-            attention_mode=2,
+-            return_softmax_lse=False,
+-        )
++        with record_activation_peak("target_attn_sfa", "npu_sparse_flash_attention", num_tokens=query.shape[0]):
++            result = torch.ops._C_ascend.npu_sparse_flash_attention(
++                query=query.contiguous(),
++                key=cache,
++                value=cache,
++                sparse_indices=indices,
++                scale_value=scale,
++                sparse_block_size=1,
++                block_table=metadata.block_table,
++                actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
++                actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
++                query_rope=None,
++                key_rope=None,
++                layout_query="TND",
++                layout_kv="PA_BSND",
++                sparse_mode=3,
++                attention_mode=2,
++                return_softmax_lse=False,
++            )
+     return result[0]
+ 
+ 
+diff --git a/vllm_ascend/models/deepseek_mtp.py b/vllm_ascend/models/deepseek_mtp.py
+index 2d5c53b29..1d2d05cfa 100644
+--- a/vllm_ascend/models/deepseek_mtp.py
++++ b/vllm_ascend/models/deepseek_mtp.py
+@@ -71,6 +71,7 @@ class AscendDeepSeekMTP(DeepSeekMTP):
+         return super()._rewrite_spec_layer_name(spec_layer, name)
+ 
+ 
++
+ class AscendGlmMoeDsaForCausalLM(GlmMoeDsaForCausalLM):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__(vllm_config=vllm_config, prefix=prefix)
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index 2e20d4712..ab476cd27 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+ from vllm_ascend.distributed.parallel_state import get_mc2_group
++from vllm_ascend.activation_memory import record_activation_peak
+ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
+ from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
+ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+@@ -185,23 +186,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+         if shared_experts_input is None:
+             hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
+ 
+-        # Record before `_maybe_pad_hidden_states` pads activations to match
+-        # `moe_config.hidden_dim`, e.g. after `align_trtllm_fp4_moe_hidden_dim_for_fi`
+-        # so routed output can be trimmed before
+-        # shared+routed add / latent up proj if needed.
+         hidden_states, og_hidden_dim_pre_xform, og_hidden_dim_post_xform = self._maybe_pad_hidden_states(
+             shared_experts_input,
+             hidden_states,
+         )
+ 
+-        result = self._forward_entry(
+-            hidden_states,
+-            router_logits,
+-            shared_experts_input,
+-            input_ids,
+-            self._encode_layer_name(),
+-            self.moe_config.hidden_dim_unpadded if self._quant_method.has_unpadded_output else 0,
+-        )
++        with record_activation_peak("target_moe_routed", f"moe_{self._encode_layer_name()}_routed"):
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                shared_experts_input,
++                input_ids,
++                self._encode_layer_name(),
++                self.moe_config.hidden_dim_unpadded if self._quant_method.has_unpadded_output else 0,
++            )
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+diff --git a/vllm_ascend/patch/worker/patch_deepseek_v2.py b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+index 94b97b0b6..c195d0e82 100644
+--- a/vllm_ascend/patch/worker/patch_deepseek_v2.py
++++ b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+@@ -36,6 +36,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
+ 
+ from vllm_ascend.utils import is_mtp_layer, should_reuse_topk
++from vllm_ascend.activation_memory import record_activation_peak
+ from vllm_ascend.worker.v2 import pp_transport
+ from vllm_ascend.worker.v2.pp_transport import (
+     PPTransportDataType,
+@@ -404,7 +405,8 @@ def _patched_forward(
+         islice(self.layers, self.start_layer, self.end_layer),
+         start=self.start_layer,
+     ):
+-        hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
++        with record_activation_peak("target_layer", f"layer_{idx}", layer_idx=idx, num_tokens=positions.shape[0]):
++            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+         # A boundary state belongs to the stage producing it, including end_layer.
+         _capture_aux_hidden_state(self, aux_hidden_states, idx + 1, hidden_states, residual, positions)
+ 
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index d51aff741..a4951c7c7 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -197,6 +197,12 @@ from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
+ from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+ from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
+ from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
++from vllm_ascend.activation_memory import (
++    activation_peak_profile_session,
++    is_activation_peak_profiling,
++    record_activation_buffer,
++    record_activation_peak,
++)
+ from vllm_ascend.spec_decode.utils import (
+     correct_optimistic_seq_lens_cpu,
+     update_num_computed_tokens_for_batch_change,
+@@ -2593,9 +2599,27 @@ class NPUModelRunner(GPUModelRunner):
+                         mamba_copy_connector = connector
+                 if mamba_copy_connector is None:
+                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
+-            hidden_states = self._model_forward(
+-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
++            self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
++            _activation_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
++            _activation_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
++            _global_rank = getattr(self, "parallel_config", None)
++            _global_rank = getattr(_global_rank, "rank", 0) if _global_rank else 0
++            _activation_enabled = _activation_debug and (
++                _activation_rank == -1 or _activation_rank == _global_rank
+             )
++            with activation_peak_profile_session(enabled=_activation_enabled, rank=_global_rank):
++                num_tokens_for_prof = scheduler_output.total_num_scheduled_tokens
++                if is_activation_peak_profiling():
++                    for kv_group in getattr(self, "kv_caches", {}).values() if isinstance(getattr(self, "kv_caches", None), dict) else []:
++                        for layer_name, cache in kv_group.items() if isinstance(kv_group, dict) else []:
++                            if hasattr(cache, "element_size") and hasattr(cache, "nbytes"):
++                                record_activation_buffer("kv_cache", layer_name, cache.nbytes)
++                with record_activation_peak(
++                    "target_model", "forward", num_tokens=num_tokens_for_prof
++                ):
++                    hidden_states = self._model_forward(
++                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
++                    )
+             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
+                 profiling_chunk_config,
+                 execution_start_time,
+@@ -2632,7 +2656,8 @@ class NPUModelRunner(GPUModelRunner):
+                     return output
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                with record_activation_peak("target_logits", "compute_logits", num_tokens=num_tokens_for_prof if is_activation_peak_profiling() else None):
++                    logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -2643,7 +2668,8 @@ class NPUModelRunner(GPUModelRunner):
+                     logits = None
+                 else:
+                     sample_hidden_states = hidden_states[logits_indices]
+-                    logits = self.model.compute_logits(sample_hidden_states)
++                    with record_activation_peak("target_logits", "compute_logits", num_tokens=num_tokens_for_prof if is_activation_peak_profiling() else None):
++                        logits = self.model.compute_logits(sample_hidden_states)
+ 
+                 model_output_broadcast_data: dict[str, Any] = {}
+                 if logits is not None:
+-- 
+2.55.0.windows.4
+
