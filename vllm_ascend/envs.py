@@ -22,6 +22,8 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+import vllm.envs
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -82,6 +84,30 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Let dense (non-MoE) decoder layers join the sequence-parallel path when
+    # use_sequence_parallel_moe is enabled (PP=1). Dense front layers otherwise
+    # keep their residual stream, fused RMSNorms and dense MLP on the FULL
+    # token chunk, which stacks several (num_tokens, hidden) bf16 tensors and
+    # dominates the absolute activation peak during chunked prefill (e.g.
+    # GLM-5.2 DSA with max_num_batched_tokens=16000). When enabled, the dense
+    # MLP keeps its TP-sharded weights and translates between the
+    # sequence-sharded activations and full tokens with all_gather /
+    # reduce_scatter around the sharded GEMMs.
+    # Default: 0 (dense layers keep the upstream full-token path). Valid
+    # values: 0 or 1.
+    "VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL": lambda: _strict_binary_env(
+        "VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL"
+    ),
+    # Additionally reduce-scatter the embedding output so the first decoder
+    # layer enters the sequence-parallel flow as well. Requires
+    # VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL=1; setting this flag to 1
+    # alone (without the flag above) is a no-op. Without this, layer 0
+    # keeps the full embedding alive as its residual while also holding the
+    # normed full activations - one extra (num_tokens, hidden) bf16 buffer at
+    # the activation peak (~187.5 MB for GLM-5.2 DSA at
+    # max_num_batched_tokens=16000).
+    # Default: 0 (embedding output stays full-token). Valid values: 0 or 1.
+    "VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING": lambda: _strict_binary_env("VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when
@@ -101,3 +127,9 @@ def __getattr__(name: str):
 
 def __dir__():
     return list(env_variables.keys())
+
+
+# Register plugin variables with vllm's env registry so that
+# envs.validate_environ() accepts every documented VLLM_ASCEND_* variable
+# instead of warning "Unknown vLLM environment variable detected".
+vllm.envs.environment_variables.update(env_variables)

@@ -428,15 +428,21 @@ def _patched_forward(
             )
         return pp_output
 
-    if hidden_states.shape[0] != positions.shape[0]:
-        combined_states = torch.cat([hidden_states, residual], dim=-1)
-        combined_states = tensor_model_parallel_all_gather(combined_states, 0)
-        combined_states = combined_states[: positions.shape[0]]
-        hidden_size = self.hidden_size
-        hidden_states, residual = combined_states.split([hidden_size, hidden_size], dim=-1)
-        residual = residual.contiguous()
+    # if hidden_states.shape[0] != positions.shape[0]:
+    #     combined_states = torch.cat([hidden_states, residual], dim=-1)
+    #     combined_states = tensor_model_parallel_all_gather(combined_states, 0)
+    #     combined_states = combined_states[: positions.shape[0]]
+    #     hidden_size = self.hidden_size
+    #     hidden_states, residual = combined_states.split([hidden_size, hidden_size], dim=-1)
+    #     residual = residual.contiguous()
 
-    hidden_states, _ = self.norm(hidden_states, residual)
+    if hidden_states.shape[0] != positions.shape[0]:
+        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        hidden_states = hidden_states[: positions.shape[0]]
+    else:
+        hidden_states, _ = self.norm(hidden_states, residual)
+
     if len(aux_hidden_states) > 0:
         return hidden_states, aux_hidden_states
     return hidden_states
